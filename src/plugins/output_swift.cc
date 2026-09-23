@@ -102,6 +102,7 @@ protected:
   size_t ncells_;    //!< Total number of top-level cells (cdim_^3).
   double box_out_;   //!< Output box length in Mpc.
   double cell_size_; //!< Top-level cell side length in Mpc.
+  double iwidth_;    //!< Inverse top-level cell width, matching SWIFT iwidth.
 
   std::array<uint64_t, 7> npart_;      //!< Particle counts in this output file.
   std::array<uint32_t, 7> npartTotal_; //!< Low words of global particle counts.
@@ -171,6 +172,7 @@ public:
 
     ncells_ = cdim_ * cdim_ * cdim_;
     cell_size_ = box_out_ / double(cdim_);
+    iwidth_ = double(cdim_) / box_out_;
 
     for (int i = 0; i < 7; ++i) {
       npart_[i] = 0;
@@ -568,18 +570,19 @@ protected:
   /**
    * @brief Compute SWIFT's flattened top-level-cell index.
    * @param x Wrapped three-dimensional position in output length units.
-   * @return Cell index with z varying fastest and x slowest.
+   * @return Cell index with z varying fastest and x slowest, matching SWIFT's
+   * cell_getid(cdim, i, j, k) macro.
    *
    * Coordinates are expected in [0, box_out_). The upper clamp protects
    * against floating-point roundoff at cell boundaries.
    */
-  inline size_t cell_id(const double x[3]) const {
+  inline size_t cell_getid(const double x[3]) const {
     size_t ijk[3];
     for (int d = 0; d < 3; ++d) {
-      const size_t i = (size_t)(x[d] / cell_size_);
+      const size_t i = (size_t)(x[d] * iwidth_);
       ijk[d] = (i >= cdim_) ? cdim_ - 1 : i;
     }
-    return (ijk[0] * cdim_ + ijk[1]) * cdim_ + ijk[2];
+    return ijk[2] + cdim_ * (ijk[1] + cdim_ * ijk[0]);
   }
 
   /**
@@ -620,7 +623,7 @@ protected:
         x[d] = this->wrap_coord(xd);
       }
 
-      const size_t c = this->cell_id(x);
+      const size_t c = this->cell_getid(x);
       cellid[i] = (uint32_t)c;
       ++counts[c];
 
@@ -998,7 +1001,7 @@ protected:
    * @brief Write species-independent /Cells groups, attributes, and centres.
    *
    * Called only by rank zero during construction. Cell centres use the same
-   * flattened order as cell_id() and all per-species cell datasets.
+   * flattened order as cell_getid() and all per-species cell datasets.
    */
   void write_common_cell_metadata() const {
     HDFCreateGroup(fname_, "Cells");
