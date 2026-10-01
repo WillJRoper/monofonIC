@@ -36,7 +36,8 @@ using swift_count_t = long long;
 static_assert(sizeof(swift_count_t) == 8,
               "SWIFT cell counts need to be 64 bit");
 
-/** @brief Contiguous section of a particle dataset written by one MPI rank. */
+/** @brief Struct to track a contiguous section of a particle dataset written by
+ * one MPI rank. */
 struct swift_write_range {
   hsize_t file_start; //!< First particle index in the global dataset.
   hsize_t length;     //!< Number of particles in the section.
@@ -67,11 +68,10 @@ template <typename T> std::vector<T> from_value(const T a) {
 /**
  * @brief Write one SWIFT-compatible HDF5 initial-conditions file.
  *
- * Particles are stored in SWIFT top-level-cell order. Cells follow SWIFT's
- * flattened (x, y, z) convention, with z varying fastest. Within each cell,
- * contributions are ordered by MPI rank and retain each rank's original local
- * particle order. /Cells records counts, offsets, bounds, and cell centres so
- * SWIFT and swiftsimio can restrict reads to spatial subregions.
+ * Particles are stored in SWIFT top-level-cell order to both reduce the
+ * movement of data during the initial redistribute of particles but also enable
+ * the use of SWIFT tools such as swiftsimio on IC files generated with
+ * Monofonic.
  *
  * With parallel HDF5, every rank opens the shared file collectively and writes
  * a union of hyperslabs. With serial HDF5, ranks use the same layout but take
@@ -84,34 +84,77 @@ template <typename write_real_t>
 class swift_output_plugin : public output_plugin {
 
 protected:
-  int num_ranks_; //!< Number of MPI ranks, or one without MPI.
-  int this_rank_; //!< Rank in MPI_COMM_WORLD, or zero without MPI.
-  int num_files_; //!< Number of output files; SWIFT output always uses one.
+  //!< Number of MPI ranks, or one without MPI.
+  int num_ranks_;
 
-  real_t lunit_;   //!< Position conversion factor to Mpc.
-  real_t vunit_;   //!< Velocity conversion factor to km/s.
-  real_t munit_;   //!< Mass conversion factor to 1e10 solar masses.
-  real_t boxsize_; //!< Comoving box length in Mpc/h from the configuration.
-  real_t hubble_param_; //!< Dimensionless Hubble parameter.
-  real_t astart_;       //!< Initial scale factor.
-  real_t zstart_;       //!< Initial redshift.
-  bool blongids_;       //!< Whether particle IDs are stored as 64-bit integers.
-  bool bdobaryons_;     //!< Whether gas particle fields are required.
+  //!< Rank in MPI_COMM_WORLD, or zero without MPI.
+  int this_rank_;
 
-  size_t cdim_;      //!< Number of top-level cells along each dimension.
-  size_t ncells_;    //!< Total number of top-level cells (cdim_^3).
-  double box_out_;   //!< Output box length in Mpc.
-  double cell_size_; //!< Top-level cell side length in Mpc.
-  double iwidth_;    //!< Inverse top-level cell width, matching SWIFT iwidth.
+  //!< Number of output files; SWIFT output always uses one.
+  int num_files_;
 
-  std::array<uint64_t, 7> npart_;      //!< Particle counts in this output file.
-  std::array<uint32_t, 7> npartTotal_; //!< Low words of global particle counts.
-  std::array<uint32_t, 7> npartTotalHighWord_; //!< High words of global counts.
-  std::array<double, 7>
-      mass_;     //!< Constant-mass table; zero means per-particle masses.
-  double time_;  //!< Initial scale factor written to /Header.
-  double ceint_; //!< Initial gas internal energy in output units.
-  double h_;     //!< Initial gas smoothing length in output units.
+  //!< Position conversion factor to Mpc.
+  real_t lunit_;
+
+  //!< Velocity conversion factor to km/s.
+  real_t vunit_;
+
+  //!< Mass conversion factor to 1e10 solar masses.
+  real_t munit_;
+
+  //!< Comoving box length in Mpc/h from the configuration.
+  real_t boxsize_;
+
+  //!< Dimensionless Hubble parameter.
+  real_t hubble_param_;
+
+  //!< Initial scale factor.
+  real_t astart_;
+
+  //!< Initial redshift.
+  real_t zstart_;
+
+  //!< Whether particle IDs are stored as 64-bit integers.
+  bool blongids_;
+
+  //!< Whether gas particle fields are required.
+  bool bdobaryons_;
+
+  //!< Number of top-level cells along each dimension.
+  size_t cdim_;
+
+  //!< Total number of top-level cells (cdim_^3).
+  size_t ncells_;
+
+  //!< Box side length in output units (Mpc, no h); alias for lunit_.
+  double dim_;
+
+  //!< Top-level cell side length in Mpc.
+  double cell_width_;
+
+  //!< Inverse top-level cell width, matching SWIFT iwidth.
+  double iwidth_;
+
+  //!< Particle counts in this output file.
+  std::array<uint64_t, 7> npart_;
+
+  //!< Low words of global particle counts.
+  std::array<uint32_t, 7> npartTotal_;
+
+  //!< High words of global counts.
+  std::array<uint32_t, 7> npartTotalHighWord_;
+
+  //!< Constant-mass table; zero means per-particle masses.
+  std::array<double, 7> mass_;
+
+  //!< Initial scale factor written to /Header.
+  double time_;
+
+  //!< Initial gas internal energy in output units.
+  double ceint_;
+
+  //!< Initial gas smoothing length in output units.
+  double h_;
 
 public:
   /**
@@ -156,7 +199,7 @@ public:
 
     //... SWIFT top-level cell grid .......................................
     cdim_ = cf_.get_value_safe<size_t>("output", "cdim", 32);
-    box_out_ = lunit_;
+    dim_ = lunit_;
 
     if (cdim_ == 0)
       throw std::runtime_error(
@@ -166,13 +209,13 @@ public:
     if (cdim_ > 895)
       throw std::runtime_error(
           "SWIFT output: 'cdim' must not exceed 895 (cell count overflow).");
-    if (!std::isfinite(box_out_) || box_out_ <= 0.0)
+    if (!std::isfinite(dim_) || dim_ <= 0.0)
       throw std::runtime_error(
           "SWIFT output: box size must be finite and positive.");
 
     ncells_ = cdim_ * cdim_ * cdim_;
-    cell_size_ = box_out_ / double(cdim_);
-    iwidth_ = double(cdim_) / box_out_;
+    cell_width_ = dim_ / double(cdim_);
+    iwidth_ = double(cdim_) / dim_;
 
     for (int i = 0; i < 7; ++i) {
       npart_[i] = 0;
@@ -362,28 +405,52 @@ public:
     }
   }
 
-  /** @return output_type::particles for every supported species. */
+  /**
+   * @brief Choose how a species is written.
+   *
+   * @return output_type::particles for every supported species.
+   */
   output_type write_species_as(const cosmo_species &) const {
     return output_type::particles;
   }
 
-  /** @return Position conversion factor from box units to Mpc. */
+  /**
+   * @brief Position unit of the output.
+   *
+   * @return Position conversion factor from box units to Mpc.
+   */
   real_t position_unit() const { return lunit_; }
 
-  /** @return Velocity conversion factor to km/s. */
+  /**
+   * @brief Velocity unit of the output.
+   *
+   * @return Velocity conversion factor to km/s.
+   */
   real_t velocity_unit() const { return vunit_; }
 
-  /** @return Mass conversion factor to 1e10 solar masses. */
+  /**
+   * @brief Mass unit of the output.
+   *
+   * @return Mass conversion factor to 1e10 solar masses.
+   */
   real_t mass_unit() const { return munit_; }
 
-  /** @return Whether particle floating-point fields are stored as doubles. */
+  /**
+   * @brief Floating-point precision of the particle fields.
+   *
+   * @return Whether particle floating-point fields are stored as doubles.
+   */
   bool has_64bit_reals() const {
     if (typeid(write_real_t) == typeid(double))
       return true;
     return false;
   }
 
-  /** @return Whether particle IDs are stored as unsigned 64-bit integers. */
+  /**
+   * @brief Integer width of the particle IDs.
+   *
+   * @return Whether particle IDs are stored as unsigned 64-bit integers.
+   */
   bool has_64bit_ids() const {
     if (blongids_)
       return true;
@@ -392,7 +459,9 @@ public:
 
   /**
    * @brief Map a monofonIC species to its Gadget/SWIFT particle-type index.
+   *
    * @param s Species to map.
+   *
    * @return Particle-type index, or -1 for an unsupported species.
    */
   int get_species_idx(const cosmo_species &s) const {
@@ -499,6 +568,10 @@ public:
 protected:
   /**
    * @brief Log maximum rank timings and estimated write throughput.
+   *
+   * MPI builds report maximum timings and range count across ranks. Rank zero
+   * writes one machine-readable SWIFT-IO line per species.
+   *
    * @param grp HDF5 particle group name.
    * @param s Species used to include optional gas fields in the byte estimate.
    * @param n_global Global particle count for the species.
@@ -506,9 +579,6 @@ protected:
    * @param t_sort Local cell-layout construction time in seconds.
    * @param t_write Local particle-field write time in seconds.
    * @param t_meta Local metadata write and synchronisation time in seconds.
-   *
-   * MPI builds report maximum timings and range count across ranks. Rank zero
-   * writes one machine-readable SWIFT-IO line per species.
    */
   void log_io_timing(const std::string &grp, const cosmo_species &s,
                      size_t n_global, size_t n_ranges, double t_sort,
@@ -546,7 +616,9 @@ protected:
                 << std::endl;
   }
 
-  /** @brief Synchronise all ranks; a no-op in non-MPI builds. */
+  /**
+   * @brief Synchronise all ranks; a no-op in non-MPI builds.
+   */
   inline void barrier() const {
 #ifdef USE_MPI
     MPI_Barrier(MPI_COMM_WORLD);
@@ -554,27 +626,31 @@ protected:
   }
 
   /**
-   * @brief Periodically wrap one coordinate into [0, box_out_).
+   * @brief Periodically wrap one coordinate into [0, dim_).
+   *
    * @param x Coordinate in output length units.
+   *
    * @return Wrapped coordinate; a rounded upper boundary maps to zero.
    */
   inline double wrap_coord(double x) const {
-    double y = std::fmod(x, box_out_);
+    double y = std::fmod(x, dim_);
     if (y < 0.0)
-      y += box_out_;
-    if (!(y < box_out_))
+      y += dim_;
+    if (!(y < dim_))
       y = 0.0; // rounding can land exactly on the upper edge
     return y;
   }
 
   /**
    * @brief Compute SWIFT's flattened top-level-cell index.
+   *
+   * Coordinates are expected in [0, dim_). The upper clamp protects
+   * against floating-point roundoff at cell boundaries.
+   *
    * @param x Wrapped three-dimensional position in output length units.
+   *
    * @return Cell index with z varying fastest and x slowest, matching SWIFT's
    * cell_getid(cdim, i, j, k) macro.
-   *
-   * Coordinates are expected in [0, box_out_). The upper clamp protects
-   * against floating-point roundoff at cell boundaries.
    */
   inline size_t cell_getid(const double x[3]) const {
     size_t ijk[3];
@@ -588,6 +664,11 @@ protected:
   /**
    * @brief Build local cell counts, bounds, and a stable cell-order
    * permutation.
+   *
+   * Empty cells retain DBL_MAX and -DBL_MAX bounds, matching SWIFT's
+   * sentinel convention. Positions are wrapped before assigning cells and
+   * calculating bounds.
+   *
    * @tparam pos_t Floating-point type of the position array.
    * @param pos Flat local position array in (x, y, z) order.
    * @param n_local Number of local particles.
@@ -596,10 +677,6 @@ protected:
    * @param[out] minpos Per-cell minima, flattened as (cell, dimension).
    * @param[out] maxpos Per-cell maxima, flattened as (cell, dimension).
    * @throws std::runtime_error If any coordinate is non-finite.
-   *
-   * Empty cells retain DBL_MAX and -DBL_MAX bounds, matching SWIFT's
-   * sentinel convention. Positions are wrapped before assigning cells and
-   * calculating bounds.
    */
   template <typename pos_t>
   void build_local_layout(const std::vector<pos_t> &pos, size_t n_local,
@@ -650,16 +727,17 @@ protected:
 
   /**
    * @brief Combine local cell layouts and derive global write offsets.
+   *
+   * rank_offset[c] equals the global start of cell c plus contributions
+   * from lower-numbered ranks. This produces a deterministic cell-major,
+   * rank-major layout without redistributing particles between ranks.
+   *
    * @param local_counts This rank's particle count in each cell.
    * @param[out] global_counts Global particle count in each cell.
    * @param[out] cell_offset Start of each cell in the species dataset.
    * @param[out] rank_offset Start of this rank's contribution to each cell.
    * @param[in,out] minpos Local bounds on input, global bounds on output.
    * @param[in,out] maxpos Local bounds on input, global bounds on output.
-   *
-   * rank_offset[c] equals the global start of cell c plus contributions
-   * from lower-numbered ranks. This produces a deterministic cell-major,
-   * rank-major layout without redistributing particles between ranks.
    */
   void global_cell_layout(const std::vector<swift_count_t> &local_counts,
                           std::vector<swift_count_t> &global_counts,
@@ -696,10 +774,12 @@ protected:
 
   /**
    * @brief Reorder a flat scalar or vector field with a particle permutation.
+   *
    * @tparam T Field element type.
    * @param src Flat source array.
    * @param perm Source particle index for each output particle.
    * @param width Elements per particle, normally one or three.
+   *
    * @return Cell-ordered copy of @p src.
    */
   template <typename T>
@@ -714,6 +794,11 @@ protected:
 
   /**
    * @brief Write one cell-ordered field into this rank's HDF5 hyperslabs.
+   *
+   * All ranges are ORed into one file-space selection. Ranks with no local
+   * particles use null/empty selections but still participate in collective
+   * writes, as required by parallel HDF5.
+   *
    * @tparam T Dataset element type.
    * @param fid Open HDF5 file handle.
    * @param name Dataset path.
@@ -722,10 +807,6 @@ protected:
    * @param width Elements per particle, normally one or three.
    * @param dxpl HDF5 transfer property list (H5P_DEFAULT or collective).
    * @throws std::runtime_error If the dataset cannot be opened or written.
-   *
-   * All ranges are ORed into one file-space selection. Ranks with no local
-   * particles use null/empty selections but still participate in collective
-   * writes, as required by parallel HDF5.
    */
   template <typename T>
   static void write_ranges(hid_t fid, const std::string &name,
@@ -768,14 +849,15 @@ protected:
 
   /**
    * @brief Attach SWIFT unit exponents to one particle dataset.
+   *
+   * Current and temperature exponents, plus the Hubble-factor exponent, are
+   * zero for every field written by this plugin.
+   *
    * @param dset Dataset path.
    * @param uM Mass-unit exponent.
    * @param uL Length-unit exponent.
    * @param ut Time-unit exponent.
    * @param a_exp Cosmological scale-factor exponent.
-   *
-   * Current and temperature exponents, plus the Hubble-factor exponent, are
-   * zero for every field written by this plugin.
    */
   void write_unit_attributes(const std::string &dset, double uM, double uL,
                              double ut, double a_exp) const {
@@ -797,13 +879,14 @@ protected:
 
   /**
    * @brief Create empty particle datasets and their unit metadata.
-   * @param grp Particle group name, for example PartType1.
-   * @param global_num_particles Dataset length.
-   * @param s Species used to decide whether gas-only fields are needed.
    *
    * Called only by rank zero. Serial HDF5 output retains checksums and
    * compression. Parallel output disables filters because collective writes to
    * filtered datasets are not portable across supported HDF5 versions.
+   *
+   * @param grp Particle group name, for example PartType1.
+   * @param global_num_particles Dataset length.
+   * @param s Species used to decide whether gas-only fields are needed.
    */
   void create_species_datasets(const std::string &grp,
                                size_t global_num_particles,
@@ -861,15 +944,16 @@ protected:
   /**
    * @brief Open the shared file and write all fields through the selected
    * backend.
+   *
+   * Parallel-HDF5 builds perform one collective file session on all ranks.
+   * Other builds serialise rank access and perform one file session per rank.
+   *
    * @param grp Particle group name.
    * @param pc Source particle container.
    * @param s Particle species.
    * @param perm Stable local cell-order permutation.
    * @param ranges Global file ranges corresponding to the permuted particles.
    * @param particle_mass Constant particle mass, ignored for individual masses.
-   *
-   * Parallel-HDF5 builds perform one collective file session on all ranks.
-   * Other builds serialise rank access and perform one file session per rank.
    */
   void write_species_fields(const std::string &grp,
                             const particle::container &pc,
@@ -918,6 +1002,11 @@ protected:
   /**
    * @brief Pack and write every dataset for one species using a shared
    * ordering.
+   *
+   * Coordinates are periodically wrapped before writing so file values and
+   * /Cells bounds describe exactly the same positions. Every other field is
+   * permuted identically, preserving particle correspondence.
+   *
    * @param fid Open HDF5 file handle.
    * @param dxpl Dataset transfer property list.
    * @param grp Particle group name.
@@ -926,10 +1015,6 @@ protected:
    * @param perm Stable local cell-order permutation.
    * @param ranges Global file ranges owned by this rank.
    * @param particle_mass Constant mass used when no individual masses exist.
-   *
-   * Coordinates are periodically wrapped before writing so file values and
-   * /Cells bounds describe exactly the same positions. Every other field is
-   * permuted identically, preserving particle correspondence.
    */
   void write_all_fields(hid_t fid, hid_t dxpl, const std::string &grp,
                         const particle::container &pc, const cosmo_species &s,
@@ -1009,7 +1094,7 @@ protected:
     HDFWriteGroupAttribute(fname_, "Cells/Meta-data", "nr_cells",
                            from_value<int>((int)ncells_));
     HDFWriteGroupAttribute(fname_, "Cells/Meta-data", "size",
-                           std::vector<double>(3, cell_size_));
+                           std::vector<double>(3, cell_width_));
     HDFWriteGroupAttribute(fname_, "Cells/Meta-data", "dimension",
                            std::vector<int>(3, (int)cdim_));
     HDFWriteGroupAttribute(fname_, "Cells/Meta-data", "Origin",
@@ -1020,9 +1105,9 @@ protected:
       for (size_t iy = 0; iy < cdim_; ++iy)
         for (size_t iz = 0; iz < cdim_; ++iz) {
           const size_t c = (ix * cdim_ + iy) * cdim_ + iz;
-          centres[3 * c + 0] = (double(ix) + 0.5) * cell_size_;
-          centres[3 * c + 1] = (double(iy) + 0.5) * cell_size_;
-          centres[3 * c + 2] = (double(iz) + 0.5) * cell_size_;
+          centres[3 * c + 0] = (double(ix) + 0.5) * cell_width_;
+          centres[3 * c + 1] = (double(iy) + 0.5) * cell_width_;
+          centres[3 * c + 2] = (double(iz) + 0.5) * cell_width_;
         }
     HDFWriteDatasetVector(fname_, "Cells/Centres", centres);
 
@@ -1035,15 +1120,16 @@ protected:
 
   /**
    * @brief Write counts, offsets, file indices, and bounds for one species.
+   *
+   * Called only by rank zero. Files is zero for every cell because this
+   * plugin always writes one shared output file. Consumers must inspect
+   * Counts before interpreting the sentinel bounds of empty cells.
+   *
    * @param grp Particle group name used as each metadata dataset name.
    * @param global_counts Global particle count in each cell.
    * @param cell_offset Start of each cell in the species datasets.
    * @param minpos Global per-cell coordinate minima.
    * @param maxpos Global per-cell coordinate maxima.
-   *
-   * Called only by rank zero. Files is zero for every cell because this
-   * plugin always writes one shared output file. Consumers must inspect
-   * Counts before interpreting the sentinel bounds of empty cells.
    */
   void
   write_species_cell_metadata(const std::string &grp,
