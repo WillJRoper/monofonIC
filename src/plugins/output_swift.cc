@@ -164,11 +164,13 @@ public:
    * /ICs_parameters, and the species-independent part of /Cells.
    *
    * Configuration keys used from [output] are filename, UseLongids, and
-   * optional cdim (default 32). cdim must be in [1, 895]; the upper bound
-   * keeps both cdim^3 and 3 * cdim^3 within signed MPI count limits.
+   * optional top_level_cells (default 32), which must be in [1, 895]; the
+   * upper bound keeps both cdim^3 and 3 * cdim^3 within signed MPI count
+   * limits.
    *
    * @param cf Complete monofonIC configuration.
    * @param pcc Cosmology calculator owned by the IC generator.
+   *
    * @throws std::runtime_error If cell geometry or box size is invalid.
    */
   explicit swift_output_plugin(config_file &cf,
@@ -198,17 +200,17 @@ public:
     bdobaryons_ = cf_.get_value<bool>("setup", "DoBaryons");
 
     //... SWIFT top-level cell grid .......................................
-    cdim_ = cf_.get_value_safe<size_t>("output", "cdim", 32);
+    cdim_ = cf_.get_value_safe<size_t>("output", "top_level_cells", 32);
     dim_ = lunit_;
 
     if (cdim_ == 0)
       throw std::runtime_error(
-          "SWIFT output: 'cdim' must be larger than zero.");
+          "SWIFT output: 'top_level_cells' must be larger than zero.");
     // cdim^3 has to fit both the int32 'nr_cells' attribute and the int MPI
     // counts used for the (3*ncells long) cell bound reductions
     if (cdim_ > 895)
-      throw std::runtime_error(
-          "SWIFT output: 'cdim' must not exceed 895 (cell count overflow).");
+      throw std::runtime_error("SWIFT output: 'top_level_cells' must not "
+                               "exceed 895 (cell count overflow).");
     if (!std::isfinite(dim_) || dim_ <= 0.0)
       throw std::runtime_error(
           "SWIFT output: box size must be finite and positive.");
