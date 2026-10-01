@@ -177,48 +177,59 @@ public:
                                std::unique_ptr<cosmology::calculator> &pcc)
       : output_plugin(cf, pcc, "SWIFT") {
 
-    // SWIFT uses a single file as IC */
+    // SWIFT uses a single IC file; rank info is filled in below under MPI
     num_files_ = 1;
     this_rank_ = 0;
     num_ranks_ = 1;
 
-    real_t astart = 1.0 / (1.0 + cf_.get_value<double>("setup", "zstart"));
-    const double rhoc = 27.7536609198; // in h^2 1e10 M_sol / Mpc^3 assuming
-                                       // SWIFT's internal constants
+    // Critical density in h^2 1e10 M_sol / Mpc^3, using SWIFT's internal
+    // physical constants
+    const double rhoc = 27.7536609198;
 
+    // Cosmology and box size from the configuration
+    real_t astart = 1.0 / (1.0 + cf_.get_value<double>("setup", "zstart"));
     hubble_param_ = pcc->cosmo_param_["h"];
     zstart_ = cf_.get_value<double>("setup", "zstart");
     astart_ = 1.0 / (1.0 + zstart_);
     boxsize_ = cf_.get_value<double>("setup", "BoxLength");
 
-    lunit_ = boxsize_ / hubble_param_; // final units will be in Mpc (without h)
-    vunit_ = boxsize_;                 // final units will be in km/s
-    munit_ = rhoc * std::pow(boxsize_, 3) /
-             hubble_param_; // final units will be in 1e10 M_sol
+    // Conversion factors to the output units: Mpc (no h), km/s and
+    // 1e10 M_sol
+    lunit_ = boxsize_ / hubble_param_;
+    vunit_ = boxsize_;
+    munit_ = rhoc * std::pow(boxsize_, 3) / hubble_param_;
 
+    // Output options
     blongids_ = cf_.get_value_safe<bool>("output", "UseLongids", true);
     bdobaryons_ = cf_.get_value<bool>("setup", "DoBaryons");
 
-    //... SWIFT top-level cell grid .......................................
+    // SWIFT top-level cell grid
     cdim_ = cf_.get_value_safe<size_t>("output", "top_level_cells", 32);
     dim_ = lunit_;
 
-    if (cdim_ == 0)
+    // Validate the grid. cdim^3 has to fit both the int32 'nr_cells'
+    // attribute and the int MPI counts used for the (3*ncells long) cell
+    // bound reductions
+    if (cdim_ == 0) {
       throw std::runtime_error(
           "SWIFT output: 'top_level_cells' must be larger than zero.");
-    // cdim^3 has to fit both the int32 'nr_cells' attribute and the int MPI
-    // counts used for the (3*ncells long) cell bound reductions
-    if (cdim_ > 895)
+    }
+    if (cdim_ > 895) {
       throw std::runtime_error("SWIFT output: 'top_level_cells' must not "
                                "exceed 895 (cell count overflow).");
-    if (!std::isfinite(dim_) || dim_ <= 0.0)
+    }
+    if (!std::isfinite(dim_) || dim_ <= 0.0) {
       throw std::runtime_error(
           "SWIFT output: box size must be finite and positive.");
+    }
 
+    // Derived cell geometry
     ncells_ = cdim_ * cdim_ * cdim_;
     cell_width_ = dim_ / double(cdim_);
     iwidth_ = double(cdim_) / dim_;
 
+    // Particle counts and masses are filled in per species as they are
+    // written
     for (int i = 0; i < 7; ++i) {
       npart_[i] = 0;
       npartTotal_[i] = 0;
@@ -233,6 +244,7 @@ public:
     MPI_Comm_size(MPI_COMM_WORLD, &num_ranks_);
 #endif
 
+    // Gas needs an initial internal energy and smoothing length
     if (bdobaryons_) {
 
       const double gamma =
@@ -241,7 +253,10 @@ public:
       const double omegab = pcc_->cosmo_param_["Omega_b"];
       const double Tcmb0 = pcc_->cosmo_param_["Tcmb"];
 
-      // compute gas internal energy
+      // Gas temperature follows the CMB until thermal decoupling at adec and
+      // then cools adiabatically as a^-2. The internal energy is
+      // k_B T / (mu m_p (gamma - 1)) with k_B and m_p in cgs, converted from
+      // (cm/s)^2 to (km/s)^2
       const double npol = (fabs(1.0 - gamma) > 1e-7) ? 1.0 / (gamma - 1.) : 1.0;
       const double unitv = 1e5;
       const double adec =
@@ -258,6 +273,7 @@ public:
       music::ilog.Print("Swift : set initial internal energy to %.2e km^2/s^2",
                         ceint_);
 
+      // Smoothing length is the mean inter-particle separation
       h_ = boxsize_ / hubble_param_ / cf_.get_value<double>("setup", "GridRes");
       music::ilog.Print("Swift : set initial smoothing length to mean "
                         "inter-part separation: %.2f Mpc",
@@ -267,32 +283,30 @@ public:
     music::ilog.Print(
         "Swift : sorting particles into a %zu^3 top-level cell grid", cdim_);
 
-    // Only ranks 0 writes the header
-    if (this_rank_ != 0)
+    // Only rank 0 creates the file and writes the run metadata
+    if (this_rank_ != 0) {
       return;
+    }
 
-    // delete output file if it exists
+    // Replace any existing output file
     unlink(fname_.c_str());
-
-    // create output HDF5 file
     HDFCreateFile(fname_);
 
-    // Write UNITS header using the physical constants assumed internally by
-    // SWIFT
+    // Units group, using the physical constants assumed internally by SWIFT:
+    // 1e10 Msun in g, 1 Mpc in cm, a time unit giving 1 km/s velocities,
+    // 1 Ampere and 1 Kelvin. Values are written as 1-element arrays, the
+    // shape SWIFT uses and swiftsimio expects
     HDFCreateGroup(fname_, "Units");
-    // written as 1-element arrays, the shape SWIFT uses and swiftsimio expects
-    HDFWriteGroupAttribute(
-        fname_, "Units", "Unit mass in cgs (U_M)",
-        from_value<double>(1.98841e43)); // 10^10 Msun in grams
+    HDFWriteGroupAttribute(fname_, "Units", "Unit mass in cgs (U_M)",
+                           from_value<double>(1.98841e43));
     HDFWriteGroupAttribute(fname_, "Units", "Unit length in cgs (U_L)",
-                           from_value<double>(3.08567758149e24)); // 1 Mpc in cm
-    HDFWriteGroupAttribute(
-        fname_, "Units", "Unit time in cgs (U_t)",
-        from_value<double>(3.08567758149e19)); // so that unit vel is 1 km/s
+                           from_value<double>(3.08567758149e24));
+    HDFWriteGroupAttribute(fname_, "Units", "Unit time in cgs (U_t)",
+                           from_value<double>(3.08567758149e19));
     HDFWriteGroupAttribute(fname_, "Units", "Unit current in cgs (U_I)",
-                           from_value<double>(1.0)); // 1 Ampere
+                           from_value<double>(1.0));
     HDFWriteGroupAttribute(fname_, "Units", "Unit temperature in cgs (U_T)",
-                           from_value<double>(1.0)); // 1 Kelvin
+                           from_value<double>(1.0));
 
     // swiftsimio identifies SWIFT files through this group
     HDFCreateGroup(fname_, "Code");
@@ -311,6 +325,8 @@ public:
     int do_baryonsVrel = cf_.get_value<bool>("setup", "DoBaryonVrel");
     int L = cf_.get_value<int>("setup", "GridRes");
 
+    // Write the ICs parameters group including all relevant information about
+    // the ICs generation
     HDFCreateGroup(fname_, "ICs_parameters");
     HDFWriteGroupAttribute(fname_, "ICs_parameters", "Code",
                            std::string("MUSIC2 - monofonIC"));
@@ -339,7 +355,6 @@ public:
     HDFWriteGroupAttribute(fname_, "ICs_parameters",
                            "Baryons Relative Velocity", do_baryonsVrel);
     HDFWriteGroupAttribute(fname_, "ICs_parameters", "Grid Resolution", L);
-
     if (tf == "CLASS") {
       double ztarget = cf_.get_value<double>("cosmology", "ztarget");
       HDFWriteGroupAttribute(fname_, "ICs_parameters", "Target Redshift",
@@ -354,11 +369,14 @@ public:
   }
 
   /**
-   * @brief Write the final SWIFT header after all species counts are known.
+   * @brief Destructor: finalise the IC file by writing the /Header group.
    *
-   * The IC generator destroys output plugins before finalising MPI. Header
-   * creation is skipped during exception unwinding to avoid presenting a
-   * partially written file as complete.
+   * The header is written here because it needs the particle counts of every
+   * species, which are only known once all write_particle_data() calls have
+   * finished. Only rank zero writes it. The IC generator destroys output
+   * plugins before finalising MPI, so this runs while MPI is still active.
+   * Header creation is skipped during exception unwinding to avoid presenting
+   * a partially written file as complete.
    */
   ~swift_output_plugin() {
     if (!std::uncaught_exceptions()) {
@@ -366,15 +384,13 @@ public:
 
         // Write Standard Gadget / SWIFT hdf5 header
         HDFCreateGroup(fname_, "Header");
-        HDFWriteGroupAttribute(fname_, "Header", "Dimension",
-                               from_value<int>(3));
+
+        // BoxSize is in Mpc, not Mpc/h for SWIFT
         HDFWriteGroupAttribute(
             fname_, "Header", "BoxSize",
-            std::vector<double>(3,
-                                boxsize_ / hubble_param_)); // in Mpc, not Mpc/h
-        HDFWriteGroupAttribute(fname_, "Header", "Scale-factor",
-                               from_value<double>(time_));
+            std::vector<double>(3, boxsize_ / hubble_param_));
 
+        // Now we can write the particle counts and masses, because we have them
         HDFWriteGroupAttribute(fname_, "Header", "NumPart_Total",
                                from_7array<unsigned>(npartTotal_));
         HDFWriteGroupAttribute(fname_, "Header", "NumPart_Total_HighWord",
@@ -384,12 +400,18 @@ public:
         HDFWriteGroupAttribute(fname_, "Header", "MassTable",
                                from_7array<double>(mass_));
 
+        // Cosmological parameters and initial time
+        HDFWriteGroupAttribute(fname_, "Header", "Scale-factor",
+                               from_value<double>(time_));
         HDFWriteGroupAttribute(fname_, "Header", "Time",
                                from_value<double>(time_));
         HDFWriteGroupAttribute(fname_, "Header", "Redshift",
                                from_value<double>(zstart_));
+
         HDFWriteGroupAttribute(fname_, "Header", "Flag_Entropy_ICs",
                                from_value<int>(0));
+        HDFWriteGroupAttribute(fname_, "Header", "Dimension",
+                               from_value<int>(3));
 
         HDFWriteGroupAttribute(fname_, "Header", "NumFilesPerSnapshot",
                                from_value<int>(num_files_));
@@ -408,9 +430,12 @@ public:
   }
 
   /**
-   * @brief Choose how a species is written.
+   * @brief Tell the IC generator whether to produce particles or grid fields.
    *
-   * @return output_type::particles for every supported species.
+   * Required by output_plugin. SWIFT ICs are always particle based, so every
+   * species is requested as particles.
+   *
+   * @return output_type::particles for every species.
    */
   output_type write_species_as(const cosmo_species &) const {
     return output_type::particles;
@@ -443,8 +468,9 @@ public:
    * @return Whether particle floating-point fields are stored as doubles.
    */
   bool has_64bit_reals() const {
-    if (typeid(write_real_t) == typeid(double))
+    if (typeid(write_real_t) == typeid(double)) {
       return true;
+    }
     return false;
   }
 
@@ -454,8 +480,9 @@ public:
    * @return Whether particle IDs are stored as unsigned 64-bit integers.
    */
   bool has_64bit_ids() const {
-    if (blongids_)
+    if (blongids_) {
       return true;
+    }
     return false;
   }
 
@@ -515,12 +542,13 @@ public:
     std::vector<swift_count_t> local_counts;
     std::vector<double> minpos, maxpos;
 
-    if (this->has_64bit_reals())
+    if (this->has_64bit_reals()) {
       this->build_local_layout(pc.positions64_, n_local, perm, local_counts,
                                minpos, maxpos);
-    else
+    } else {
       this->build_local_layout(pc.positions32_, n_local, perm, local_counts,
                                minpos, maxpos);
+    }
 
     //... turn that into the global, cell-major file layout ...............
     std::vector<swift_count_t> global_counts, cell_offset, rank_offset;
@@ -530,14 +558,16 @@ public:
     //... the file ranges this rank contributes, adjacent cells merged ....
     std::vector<swift_write_range> ranges;
     for (size_t c = 0; c < ncells_; ++c) {
-      if (local_counts[c] == 0)
+      if (local_counts[c] == 0) {
         continue;
+      }
       const hsize_t fs = (hsize_t)rank_offset[c];
       if (!ranges.empty() &&
-          ranges.back().file_start + ranges.back().length == fs)
+          ranges.back().file_start + ranges.back().length == fs) {
         ranges.back().length += (hsize_t)local_counts[c];
-      else
+      } else {
         ranges.push_back({fs, (hsize_t)local_counts[c]});
+      }
     }
 
     const double t_sorted = get_wtime();
@@ -557,9 +587,10 @@ public:
     const double t_written = get_wtime();
 
     // rank 0 records the cell metadata for this species
-    if (this_rank_ == 0)
+    if (this_rank_ == 0) {
       this->write_species_cell_metadata(grp, global_counts, cell_offset, minpos,
                                         maxpos);
+    }
     this->barrier();
 
     this->log_io_timing(grp, s, global_num_particles, ranges.size(),
@@ -592,14 +623,18 @@ protected:
     MPI_Allreduce(MPI_IN_PLACE, &ranges_max, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX,
                   MPI_COMM_WORLD);
 #endif
-    if (this_rank_ != 0)
+    if (this_rank_ != 0) {
       return;
+    }
 
+    // Bytes per particle: positions, velocities, ID and mass, plus internal
+    // energy and smoothing length for gas
     const size_t nreal = this->has_64bit_reals() ? 8 : 4;
     const size_t nid = this->has_64bit_ids() ? 8 : 4;
-    size_t per_particle = 6 * nreal + nid + nreal; // pos, vel, id, mass
-    if (bdobaryons_ && s == cosmo_species::baryon)
+    size_t per_particle = 6 * nreal + nid + nreal;
+    if (bdobaryons_ && s == cosmo_species::baryon) {
       per_particle += 2 * sizeof(write_real_t);
+    }
     const double gbytes =
         double(n_global) * double(per_particle) / (1024. * 1024. * 1024.);
 
@@ -636,10 +671,13 @@ protected:
    */
   inline double wrap_coord(double x) const {
     double y = std::fmod(x, dim_);
-    if (y < 0.0)
+    if (y < 0.0) {
       y += dim_;
-    if (!(y < dim_))
-      y = 0.0; // rounding can land exactly on the upper edge
+    }
+    // Rounding can land exactly on the upper edge
+    if (!(y < dim_)) {
+      y = 0.0;
+    }
     return y;
   }
 
@@ -696,9 +734,10 @@ protected:
       double x[3];
       for (int d = 0; d < 3; ++d) {
         const double xd = (double)pos[3 * i + d];
-        if (!std::isfinite(xd))
+        if (!std::isfinite(xd)) {
           throw std::runtime_error(
               "SWIFT output: encountered a non-finite particle coordinate.");
+        }
         x[d] = this->wrap_coord(xd);
       }
 
@@ -707,10 +746,12 @@ protected:
       ++counts[c];
 
       for (int d = 0; d < 3; ++d) {
-        if (x[d] < minpos[3 * c + d])
+        if (x[d] < minpos[3 * c + d]) {
           minpos[3 * c + d] = x[d];
-        if (x[d] > maxpos[3 * c + d])
+        }
+        if (x[d] > maxpos[3 * c + d]) {
           maxpos[3 * c + d] = x[d];
+        }
       }
     }
 
@@ -723,8 +764,9 @@ protected:
     }
 
     perm.resize(n_local);
-    for (size_t i = 0; i < n_local; ++i)
+    for (size_t i = 0; i < n_local; ++i) {
       perm[next[cellid[i]]++] = i;
+    }
   }
 
   /**
@@ -755,9 +797,10 @@ protected:
                   MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
     MPI_Exscan(local_counts.data(), preceding.data(), (int)ncells_,
                MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-    if (this_rank_ == 0)
-      std::fill(preceding.begin(), preceding.end(),
-                0); // MPI_Exscan leaves rank 0 undefined
+    // MPI_Exscan leaves rank 0 undefined
+    if (this_rank_ == 0) {
+      std::fill(preceding.begin(), preceding.end(), 0);
+    }
     MPI_Allreduce(MPI_IN_PLACE, minpos.data(), (int)(3 * ncells_), MPI_DOUBLE,
                   MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, maxpos.data(), (int)(3 * ncells_), MPI_DOUBLE,
@@ -788,9 +831,11 @@ protected:
   static std::vector<T> permute(const std::vector<T> &src,
                                 const std::vector<size_t> &perm, size_t width) {
     std::vector<T> out(perm.size() * width);
-    for (size_t i = 0; i < perm.size(); ++i)
-      for (size_t d = 0; d < width; ++d)
+    for (size_t i = 0; i < perm.size(); ++i) {
+      for (size_t d = 0; d < width; ++d) {
         out[i * width + d] = src[perm[i] * width + d];
+      }
+    }
     return out;
   }
 
@@ -816,8 +861,9 @@ protected:
                            const std::vector<T> &data, size_t width,
                            hid_t dxpl) {
     hid_t dset = H5Dopen(fid, name.c_str());
-    if (dset < 0)
+    if (dset < 0) {
       throw std::runtime_error("SWIFT output: cannot open dataset " + name);
+    }
 
     hid_t fspace = H5Dget_space(dset);
     hid_t mspace;
@@ -841,8 +887,9 @@ protected:
     }
 
     if (H5Dwrite(dset, GetDataType<T>(), mspace, fspace, dxpl,
-                 data.empty() ? NULL : &data[0]) < 0)
+                 data.empty() ? NULL : &data[0]) < 0) {
       throw std::runtime_error("SWIFT output: failed to write dataset " + name);
+    }
 
     H5Sclose(mspace);
     H5Sclose(fspace);
@@ -919,12 +966,13 @@ protected:
                                    global_num_particles, filter);
     }
 
-    if (this->has_64bit_ids())
+    if (this->has_64bit_ids()) {
       HDFCreateEmptyDataset<uint64_t>(fname_, grp + "/ParticleIDs",
                                       global_num_particles, filter);
-    else
+    } else {
       HDFCreateEmptyDataset<uint32_t>(fname_, grp + "/ParticleIDs",
                                       global_num_particles, filter);
+    }
 
     this->write_unit_attributes(grp + "/Coordinates", 0.0, 1.0, 0.0, 1.0);
     this->write_unit_attributes(grp + "/Velocities", 0.0, 1.0, -1.0, 0.0);
@@ -967,9 +1015,10 @@ protected:
     hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
     H5Pset_fapl_mpio(fapl, MPI_COMM_WORLD, MPI_INFO_NULL);
     hid_t fid = H5Fopen(fname_.c_str(), H5F_ACC_RDWR, fapl);
-    if (fid < 0)
+    if (fid < 0) {
       throw std::runtime_error("SWIFT output: cannot open " + fname_ +
                                " for collective writing.");
+    }
 
     hid_t dxpl = H5Pcreate(H5P_DATASET_XFER);
     H5Pset_dxpl_mpio(dxpl, H5FD_MPIO_COLLECTIVE);
@@ -984,21 +1033,24 @@ protected:
     // opening it once
     for (int rank = 0; rank < num_ranks_; ++rank) {
       this->barrier();
-      if (rank != this_rank_)
+      if (rank != this_rank_) {
         continue;
+      }
 
       hid_t fid = H5Fopen(fname_.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
-      if (fid < 0)
+      if (fid < 0) {
         throw std::runtime_error("SWIFT output: cannot open " + fname_ +
                                  " for writing.");
+      }
       this->write_all_fields(fid, H5P_DEFAULT, grp, pc, s, perm, ranges,
                              particle_mass);
       H5Fclose(fid);
     }
 #endif
-    if (this_rank_ == 0)
+    if (this_rank_ == 0) {
       music::ilog << "Wrote cell-ordered " << grp << " data to the IC file."
                   << std::endl;
+    }
   }
 
   /**
@@ -1025,52 +1077,57 @@ protected:
                         double particle_mass) const {
     const size_t n_local = perm.size();
 
-    //... positions, stored periodically wrapped so that they match the cell
-    // metadata
+    //... positions, wrapped periodically to match the cell metadata
     if (this->has_64bit_reals()) {
       auto buf = permute(pc.positions64_, perm, 3);
-      for (auto &x : buf)
+      for (auto &x : buf) {
         x = this->wrap_coord(x);
+      }
       write_ranges(fid, grp + "/Coordinates", ranges, buf, 3, dxpl);
     } else {
       auto buf = permute(pc.positions32_, perm, 3);
-      for (auto &x : buf)
+      for (auto &x : buf) {
         x = (float)this->wrap_coord((double)x);
+      }
       write_ranges(fid, grp + "/Coordinates", ranges, buf, 3, dxpl);
     }
 
     //... velocities
-    if (this->has_64bit_reals())
+    if (this->has_64bit_reals()) {
       write_ranges(fid, grp + "/Velocities", ranges,
                    permute(pc.velocities64_, perm, 3), 3, dxpl);
-    else
+    } else {
       write_ranges(fid, grp + "/Velocities", ranges,
                    permute(pc.velocities32_, perm, 3), 3, dxpl);
+    }
 
     //... ids
-    if (this->has_64bit_ids())
+    if (this->has_64bit_ids()) {
       write_ranges(fid, grp + "/ParticleIDs", ranges,
                    permute(pc.ids64_, perm, 1), 1, dxpl);
-    else
+    } else {
       write_ranges(fid, grp + "/ParticleIDs", ranges,
                    permute(pc.ids32_, perm, 1), 1, dxpl);
+    }
 
     //... masses
     if (pc.bhas_individual_masses_) {
-      if (this->has_64bit_reals())
+      if (this->has_64bit_reals()) {
         write_ranges(fid, grp + "/Masses", ranges, permute(pc.mass64_, perm, 1),
                      1, dxpl);
-      else
+      } else {
         write_ranges(fid, grp + "/Masses", ranges, permute(pc.mass32_, perm, 1),
                      1, dxpl);
+      }
     } else {
-      if (this->has_64bit_reals())
+      if (this->has_64bit_reals()) {
         write_ranges(fid, grp + "/Masses", ranges,
                      std::vector<double>(n_local, particle_mass), 1, dxpl);
-      else
+      } else {
         write_ranges(fid, grp + "/Masses", ranges,
                      std::vector<float>(n_local, (float)particle_mass), 1,
                      dxpl);
+      }
     }
 
     //... gas internal energy and smoothing length if baryons are enabled
@@ -1103,14 +1160,16 @@ protected:
                            std::vector<double>(3, 0.0));
 
     std::vector<double> centres(3 * ncells_);
-    for (size_t ix = 0; ix < cdim_; ++ix)
-      for (size_t iy = 0; iy < cdim_; ++iy)
+    for (size_t ix = 0; ix < cdim_; ++ix) {
+      for (size_t iy = 0; iy < cdim_; ++iy) {
         for (size_t iz = 0; iz < cdim_; ++iz) {
           const size_t c = (ix * cdim_ + iy) * cdim_ + iz;
           centres[3 * c + 0] = (double(ix) + 0.5) * cell_width_;
           centres[3 * c + 1] = (double(iy) + 0.5) * cell_width_;
           centres[3 * c + 2] = (double(iz) + 0.5) * cell_width_;
         }
+      }
+    }
     HDFWriteDatasetVector(fname_, "Cells/Centres", centres);
 
     HDFCreateGroup(fname_, "Cells/Files");
