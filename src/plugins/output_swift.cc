@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdarg>
 #include <iomanip>
 #include <output_plugin.hh>
 #include <vector>
@@ -407,11 +406,15 @@ public:
                                from_value<int>(num_files_));
 
         // Report the finished file and how SWIFT should read it
-        log_entry("SWIFT IC file written", "%s", fname_.c_str());
-        log_entry("SWIFT IC units", "Mpc, km/s, 1e10 Msun (no h or sqrt(a) "
-                                    "factors)");
-        log_entry("SWIFT InitialConditions", "leave cleanup_h_factors and "
-                                             "cleanup_velocity_factors off");
+        music::ilog << "Done writing SWIFT IC file to " << fname_ << std::endl;
+        music::ilog << "Note that the IC file does not contain any h-factors "
+                       "nor any extra sqrt(a)-factors for the velocities"
+                    << std::endl;
+        music::ilog
+            << "The SWIFT parameters 'InitialConditions:cleanup_h_factors' and "
+               "'InitialConditions:cleanup_velocity_factors' should hence "
+               "*NOT* be set!"
+            << std::endl;
       }
     }
   }
@@ -1119,59 +1122,42 @@ protected:
   }
 
   /**
-   * @brief Print one line in monofonIC's aligned "key : value" log style.
-   *
-   * @param key Label, padded to the 32 characters used throughout the log.
-   * @param format printf-style format for the value.
-   */
-  static void log_entry(const char *key, const char *format, ...)
-      __attribute__((format(printf, 2, 3))) {
-    char value[512];
-    va_list args;
-    va_start(args, format);
-    vsnprintf(value, sizeof(value), format, args);
-    va_end(args);
-    music::ilog << std::setw(32) << std::left << key << " : "
-                << colors::CONFIG_VALUE << value << colors::RESET << std::endl;
-  }
-
-  /**
-   * @brief Log the output file, HDF5 backend, precision and cell grid.
+   * @brief Log the cell grid, HDF5 backend and initial gas state.
    *
    * Called from the constructor on every rank; only rank 0 logs at info
-   * level. Gas properties are reported when baryons are enabled.
+   * level. Follows the "SWIFT : ..." sentence style of the other plugins.
    */
   void log_setup() const {
 
-    // Where the ICs go and how they are written
-    log_entry("SWIFT IC file", "%s", fname_.c_str());
-#ifdef USE_PARALLEL_HDF5
-    log_entry("SWIFT HDF5 backend", "parallel, %d task(s) writing collectively",
-              num_ranks_);
-#else
-    log_entry("SWIFT HDF5 backend", "serial, %d task(s) writing in turn",
-              num_ranks_);
-#endif
-    log_entry("SWIFT particle precision", "%s reals, %s IDs",
-              this->has_64bit_reals() ? "64-bit" : "32-bit",
-              this->has_64bit_ids() ? "64-bit" : "32-bit");
-
     // The top-level cell grid the particles are sorted into
-    log_entry("SWIFT top-level cells", "%zu^3 = %zu cells of width %.4g Mpc",
-              cdim_, ncells_, cell_width_);
+    music::ilog.Print("SWIFT : sorting particles into %zu^3 top-level cells of "
+                      "width %.4g Mpc",
+                      cdim_, cell_width_);
+
+    // How the IC file is written
+#ifdef USE_PARALLEL_HDF5
+    music::ilog.Print("SWIFT : writing with parallel HDF5 from %d task(s)",
+                      num_ranks_);
+#else
+    music::ilog.Print("SWIFT : writing with serial HDF5, %d task(s) in turn",
+                      num_ranks_);
+#endif
 
     // Initial gas state
     if (bdobaryons_) {
-      log_entry("SWIFT gas temperature", "%.2f K/mu", gas_temperature_over_mu_);
-      log_entry("SWIFT gas internal energy", "%.4e (km/s)^2", internal_energy_);
-      log_entry("SWIFT gas smoothing length", "%.4g Mpc (grid spacing)",
-                smoothing_length_);
+      music::ilog.Print("SWIFT : set initial gas temperature to %.2f K/mu",
+                        gas_temperature_over_mu_);
+      music::ilog.Print("SWIFT : set initial internal energy to %.2e km^2/s^2",
+                        internal_energy_);
+      music::ilog.Print("SWIFT : set initial smoothing length to the grid "
+                        "spacing: %.4g Mpc",
+                        smoothing_length_);
     }
   }
 
   /**
-   * @brief Log one species' cell occupancy, slowest-rank timings and
-   * throughput.
+   * @brief Log one species' cell occupancy and slowest-rank sort and write
+   * timings.
    *
    * MPI builds report the maximum timings and hyperslab count across ranks.
    * Called on every rank because of the reductions; only rank 0 logs.
@@ -1183,20 +1169,18 @@ protected:
    * @param n_ranges Number of hyperslabs written by this rank.
    * @param t_sort Local sorting and lookup table time in seconds.
    * @param t_write Local particle-field write time in seconds.
-   * @param t_meta Local cell metadata write and synchronisation time in
-   * seconds.
    */
   void log_species_summary(const std::string &grp, const cosmo_species &s,
                            size_t n_global,
                            const std::vector<swift_count_t> &global_counts,
-                           size_t n_ranges, double t_sort, double t_write,
-                           double t_meta) const {
+                           size_t n_ranges, double t_sort,
+                           double t_write) const {
 
     // Take the slowest rank's timings and the largest hyperslab count
-    double tmax[3] = {t_sort, t_write, t_meta};
+    double tmax[2] = {t_sort, t_write};
     unsigned long long ranges_max = n_ranges;
 #ifdef USE_MPI
-    MPI_Allreduce(MPI_IN_PLACE, tmax, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, tmax, 2, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &ranges_max, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX,
                   MPI_COMM_WORLD);
 #endif
@@ -1224,16 +1208,15 @@ protected:
     const double gbytes =
         double(n_global) * double(per_particle) / (1024. * 1024. * 1024.);
 
-    const std::string key = "SWIFT " + grp;
-    log_entry((key + " cells").c_str(),
-              "%zu of %zu filled, %lld to %lld per cell (mean %.4g)", n_filled,
-              ncells_, *minmax.first, *minmax.second,
-              double(n_global) / double(ncells_));
-    log_entry((key + " hyperslabs").c_str(), "%llu per task (max)", ranges_max);
-    log_entry((key + " timings").c_str(),
-              "sort %.3g s, write %.3g s (%.3g GB at %.3g GB/s), cells %.3g s",
-              tmax[0], tmax[1], gbytes, tmax[1] > 0. ? gbytes / tmax[1] : 0.,
-              tmax[2]);
+    // Cell occupancy, then where the time went
+    music::ilog.Print("SWIFT : %zu of %zu cells filled, %lld to %lld particles "
+                      "per cell (mean %.3g)",
+                      n_filled, ncells_, *minmax.first, *minmax.second,
+                      double(n_global) / double(ncells_));
+    music::ilog.Print("SWIFT : sorted in %.3g s, wrote %.3g GB in %.3g s "
+                      "(%.3g GB/s), max %llu hyperslab(s) per task",
+                      tmax[0], gbytes, tmax[1],
+                      tmax[1] > 0. ? gbytes / tmax[1] : 0., ranges_max);
   }
 
 public:
@@ -1274,6 +1257,12 @@ public:
         pc.bhas_individual_masses_
             ? 0.0
             : Omega_species * munit_ / double(global_num_particles);
+
+    // Announce the write in the same task style as the LPT steps
+    const std::string task = "Writing " + grp + " to the SWIFT IC file";
+    music::ilog << colors::SYM_CHECK << " " << colors::TASK_NAME << task
+                << colors::RESET << std::setw(77 - (int)task.size())
+                << std::setfill('.') << std::left << "" << std::endl;
 
     const double t_start = get_wtime();
 
@@ -1321,7 +1310,10 @@ public:
     // Report the cell occupancy and timings for this species
     this->log_species_summary(grp, s, global_num_particles, global_counts,
                               ranges.size(), t_sorted - t_start,
-                              t_written - t_sorted, get_wtime() - t_written);
+                              t_written - t_sorted);
+    music::ilog << std::setw(70) << std::setfill(' ') << std::right
+                << "took : " << std::setw(8) << get_wtime() - t_start << "s"
+                << std::endl;
   }
 };
 
