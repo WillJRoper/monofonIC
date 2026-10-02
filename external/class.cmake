@@ -11,6 +11,8 @@ FetchContent_Declare(
     PATCH_COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/external/CLASS_CMakeLists.txt
         <SOURCE_DIR>/CMakeLists.txt
+      COMMAND ${CMAKE_COMMAND} -DCLASS_SOURCE_DIR=<SOURCE_DIR>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/external/class_patch.cmake
 )
 
 set(FETCHCONTENT_QUIET OFF)
