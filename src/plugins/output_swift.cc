@@ -18,8 +18,11 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #ifdef USE_HDF5
 #include "HDF_IO.hh"
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdarg>
+#include <iomanip>
 #include <output_plugin.hh>
 #include <vector>
 
@@ -149,6 +152,9 @@ protected:
   //! Initial gas smoothing length in Mpc (comoving).
   double smoothing_length_;
 
+  //! Initial gas temperature over the mean molecular weight, in K, for the log.
+  double gas_temperature_over_mu_;
+
 public:
   /**
    * @brief Initialise units, cell geometry, and rank-independent metadata.
@@ -254,24 +260,18 @@ public:
       const double k_B = 1.380649e-16;
       const double m_p = 1.67262192369e-24;
       internal_energy_ = k_B / m_p * Tini * npol / mu / unitv / unitv;
-
-      music::ilog.Print("Swift : Calculated initial gas temperature: %.2f K/mu",
-                        Tini / mu);
-      music::ilog.Print("Swift : set initial internal energy to %.2e km^2/s^2",
-                        internal_energy_);
+      gas_temperature_over_mu_ = Tini / mu;
 
       // SWIFT requires a SmoothingLength field in gas ICs but recomputes h in
       // its first density loop, so the grid spacing is only an initial guess.
       // bcc and fcc loads have a smaller mean particle separation
       smoothing_length_ =
           boxsize_ / hubble_param_ / cf_.get_value<double>("setup", "GridRes");
-      music::ilog.Print(
-          "Swift : set initial smoothing length to the grid spacing: %.2f Mpc",
-          smoothing_length_);
     }
 
-    music::ilog.Print(
-        "Swift : sorting particles into a %zu^3 top-level cell grid", cdim_);
+    // Report the output setup, matching the aligned "key : value" style of
+    // the rest of the log (only rank 0 logs at info level)
+    this->log_setup();
 
     // Only rank 0 creates the file and writes the run metadata
     if (this_rank_ != 0) {
@@ -406,15 +406,12 @@ public:
         HDFWriteGroupAttribute(fname_, "Header", "NumFilesPerSnapshot",
                                from_value<int>(num_files_));
 
-        music::ilog << "Done writing SWIFT IC file to " << fname_ << std::endl;
-        music::ilog << "Note that the IC file does not contain any h-factors "
-                       "nor any extra sqrt(a)-factors for the velocities"
-                    << std::endl;
-        music::ilog
-            << "The SWIFT parameters 'InitialConditions:cleanup_h_factors' and "
-               "'InitialConditions:cleanup_velocity_factors' should hence "
-               "*NOT* be set!"
-            << std::endl;
+        // Report the finished file and how SWIFT should read it
+        log_entry("SWIFT IC file written", "%s", fname_.c_str());
+        log_entry("SWIFT IC units", "Mpc, km/s, 1e10 Msun (no h or sqrt(a) "
+                                    "factors)");
+        log_entry("SWIFT InitialConditions", "leave cleanup_h_factors and "
+                                             "cleanup_velocity_factors off");
       }
     }
   }
@@ -1056,12 +1053,6 @@ protected:
       H5Fclose(fid);
     }
 #endif
-
-    // Report the write
-    if (this_rank_ == 0) {
-      music::ilog << "Wrote cell-ordered " << grp << " data to the IC file."
-                  << std::endl;
-    }
   }
 
   /**
@@ -1128,24 +1119,80 @@ protected:
   }
 
   /**
-   * @brief Log maximum rank timings and estimated write throughput.
+   * @brief Print one line in monofonIC's aligned "key : value" log style.
    *
-   * MPI builds report maximum timings and range count across ranks. Rank zero
-   * writes one machine-readable SWIFT-IO line per species.
+   * @param key Label, padded to the 32 characters used throughout the log.
+   * @param format printf-style format for the value.
+   */
+  static void log_entry(const char *key, const char *format, ...)
+      __attribute__((format(printf, 2, 3))) {
+    char value[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(value, sizeof(value), format, args);
+    va_end(args);
+    music::ilog << std::setw(32) << std::left << key << " : "
+                << colors::CONFIG_VALUE << value << colors::RESET << std::endl;
+  }
+
+  /**
+   * @brief Log the output file, HDF5 backend, precision and cell grid.
+   *
+   * Called from the constructor on every rank; only rank 0 logs at info
+   * level. Gas properties are reported when baryons are enabled.
+   */
+  void log_setup() const {
+
+    // Where the ICs go and how they are written
+    log_entry("SWIFT IC file", "%s", fname_.c_str());
+#ifdef USE_PARALLEL_HDF5
+    log_entry("SWIFT HDF5 backend", "parallel, %d task(s) writing collectively",
+              num_ranks_);
+#else
+    log_entry("SWIFT HDF5 backend", "serial, %d task(s) writing in turn",
+              num_ranks_);
+#endif
+    log_entry("SWIFT particle precision", "%s reals, %s IDs",
+              this->has_64bit_reals() ? "64-bit" : "32-bit",
+              this->has_64bit_ids() ? "64-bit" : "32-bit");
+
+    // The top-level cell grid the particles are sorted into
+    log_entry("SWIFT top-level cells", "%zu^3 = %zu cells of width %.4g Mpc",
+              cdim_, ncells_, cell_width_);
+
+    // Initial gas state
+    if (bdobaryons_) {
+      log_entry("SWIFT gas temperature", "%.2f K/mu", gas_temperature_over_mu_);
+      log_entry("SWIFT gas internal energy", "%.4e (km/s)^2", internal_energy_);
+      log_entry("SWIFT gas smoothing length", "%.4g Mpc (grid spacing)",
+                smoothing_length_);
+    }
+  }
+
+  /**
+   * @brief Log one species' cell occupancy, slowest-rank timings and
+   * throughput.
+   *
+   * MPI builds report the maximum timings and hyperslab count across ranks.
+   * Called on every rank because of the reductions; only rank 0 logs.
    *
    * @param grp HDF5 particle group name.
-   * @param s Species used to include optional gas fields in the byte estimate.
+   * @param s Species, used to include gas fields in the byte count.
    * @param n_global Global particle count for the species.
-   * @param n_ranges Number of disjoint file ranges written by this rank.
-   * @param t_sort Local cell-layout construction time in seconds.
+   * @param global_counts Global particle count in each cell.
+   * @param n_ranges Number of hyperslabs written by this rank.
+   * @param t_sort Local sorting and lookup table time in seconds.
    * @param t_write Local particle-field write time in seconds.
-   * @param t_meta Local metadata write and synchronisation time in seconds.
+   * @param t_meta Local cell metadata write and synchronisation time in
+   * seconds.
    */
-  void log_io_timing(const std::string &grp, const cosmo_species &s,
-                     size_t n_global, size_t n_ranges, double t_sort,
-                     double t_write, double t_meta) const {
+  void log_species_summary(const std::string &grp, const cosmo_species &s,
+                           size_t n_global,
+                           const std::vector<swift_count_t> &global_counts,
+                           size_t n_ranges, double t_sort, double t_write,
+                           double t_meta) const {
 
-    // Take the slowest rank's timings and the largest range count
+    // Take the slowest rank's timings and the largest hyperslab count
     double tmax[3] = {t_sort, t_write, t_meta};
     unsigned long long ranges_max = n_ranges;
 #ifdef USE_MPI
@@ -1159,32 +1206,34 @@ protected:
       return;
     }
 
-    // Bytes per particle: positions, velocities, ID and mass, plus internal
+    // Cell occupancy from the global cell lookup table
+    const auto minmax =
+        std::minmax_element(global_counts.begin(), global_counts.end());
+    const size_t n_filled =
+        ncells_ -
+        (size_t)std::count(global_counts.begin(), global_counts.end(), 0);
+
+    // Bytes written: positions, velocities, ID and mass, plus internal
     // energy and smoothing length for gas
     const size_t nreal = this->has_64bit_reals() ? 8 : 4;
     const size_t nid = this->has_64bit_ids() ? 8 : 4;
-    size_t per_particle = 6 * nreal + nid + nreal;
+    size_t per_particle = 7 * nreal + nid;
     if (bdobaryons_ && s == cosmo_species::baryon) {
       per_particle += 2 * sizeof(write_real_t);
     }
     const double gbytes =
         double(n_global) * double(per_particle) / (1024. * 1024. * 1024.);
 
-    // Name the HDF5 backend in use
-#ifdef USE_PARALLEL_HDF5
-    const char *backend = "parallel";
-#else
-    const char *backend = "serial";
-#endif
-
-    // Write one machine-readable line for this species
-    music::ilog << "SWIFT-IO " << grp << " backend=" << backend
-                << " nranks=" << num_ranks_ << " cdim=" << cdim_
-                << " npart=" << n_global << " max_ranges=" << ranges_max
-                << " t_sort=" << tmax[0] << " t_write=" << tmax[1]
-                << " t_meta=" << tmax[2] << " GB=" << gbytes
-                << " GB_per_s=" << (tmax[1] > 0. ? gbytes / tmax[1] : 0.)
-                << std::endl;
+    const std::string key = "SWIFT " + grp;
+    log_entry((key + " cells").c_str(),
+              "%zu of %zu filled, %lld to %lld per cell (mean %.4g)", n_filled,
+              ncells_, *minmax.first, *minmax.second,
+              double(n_global) / double(ncells_));
+    log_entry((key + " hyperslabs").c_str(), "%llu per task (max)", ranges_max);
+    log_entry((key + " timings").c_str(),
+              "sort %.3g s, write %.3g s (%.3g GB at %.3g GB/s), cells %.3g s",
+              tmax[0], tmax[1], gbytes, tmax[1] > 0. ? gbytes / tmax[1] : 0.,
+              tmax[2]);
   }
 
 public:
@@ -1254,8 +1303,6 @@ public:
     // Rank 0 creates the full, empty datasets in the file
     if (this_rank_ == 0) {
       this->create_species_datasets(grp, global_num_particles, s);
-      music::ilog << "Created empty arrays for " << grp << " into file "
-                  << fname_ << "." << std::endl;
     }
     this->barrier();
 
@@ -1271,10 +1318,10 @@ public:
     }
     this->barrier();
 
-    // Report the timings for this species
-    this->log_io_timing(grp, s, global_num_particles, ranges.size(),
-                        t_sorted - t_start, t_written - t_sorted,
-                        get_wtime() - t_written);
+    // Report the cell occupancy and timings for this species
+    this->log_species_summary(grp, s, global_num_particles, global_counts,
+                              ranges.size(), t_sorted - t_start,
+                              t_written - t_sorted, get_wtime() - t_written);
   }
 };
 
