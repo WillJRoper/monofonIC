@@ -1156,46 +1156,72 @@ protected:
   }
 
   /**
-   * @brief Log one species' cell occupancy and slowest-rank sort and write
-   * timings.
+   * @brief Start a timed stage in the same style as the LPT steps.
    *
-   * MPI builds report the maximum timings and hyperslab count across ranks.
-   * Called on every rank because of the reductions; only rank 0 logs.
+   * @param task Name of the stage, printed after the task symbol.
+   */
+  static void log_task_start(const std::string &task) {
+    music::ilog << colors::SYM_CHECK << " " << colors::TASK_NAME << task
+                << colors::RESET << std::setw(77 - (int)task.size())
+                << std::setfill('.') << std::left << "" << std::endl;
+  }
+
+  /**
+   * @brief Finish a timed stage with its right-aligned "took" line.
    *
-   * @param grp HDF5 particle group name.
-   * @param s Species, used to include gas fields in the byte count.
+   * @param t_start Wall-clock time at which the stage started.
+   */
+  static void log_task_took(double t_start) {
+    music::ilog << std::setw(70) << std::setfill(' ') << std::right
+                << "took : " << std::setw(8) << get_wtime() - t_start << "s"
+                << std::endl;
+  }
+
+  /**
+   * @brief Log how particles are spread over the top-level cells and how many
+   * hyperslabs the busiest task will write.
+   *
+   * Called on every rank because of the hyperslab reduction; only rank 0
+   * logs at info level.
+   *
    * @param n_global Global particle count for the species.
    * @param global_counts Global particle count in each cell.
-   * @param n_ranges Number of hyperslabs written by this rank.
-   * @param t_sort Local sorting and lookup table time in seconds.
-   * @param t_write Local particle-field write time in seconds.
+   * @param n_ranges Number of hyperslabs this rank will write.
    */
-  void log_species_summary(const std::string &grp, const cosmo_species &s,
-                           size_t n_global,
-                           const std::vector<swift_count_t> &global_counts,
-                           size_t n_ranges, double t_sort,
-                           double t_write) const {
+  void log_cell_occupancy(size_t n_global,
+                          const std::vector<swift_count_t> &global_counts,
+                          size_t n_ranges) const {
 
-    // Take the slowest rank's timings and the largest hyperslab count
-    double tmax[2] = {t_sort, t_write};
+    // Largest hyperslab count across ranks
     unsigned long long ranges_max = n_ranges;
 #ifdef USE_MPI
-    MPI_Allreduce(MPI_IN_PLACE, tmax, 2, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &ranges_max, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX,
                   MPI_COMM_WORLD);
 #endif
 
-    // Only rank 0 reports
-    if (this_rank_ != 0) {
-      return;
-    }
-
-    // Cell occupancy from the global cell lookup table
+    // Occupancy of the global cell lookup table
     const auto minmax =
         std::minmax_element(global_counts.begin(), global_counts.end());
     const size_t n_filled =
         ncells_ -
         (size_t)std::count(global_counts.begin(), global_counts.end(), 0);
+
+    music::ilog.Print("SWIFT : %zu of %zu cells filled, %lld to %lld particles "
+                      "per cell (mean %.3g)",
+                      n_filled, ncells_, *minmax.first, *minmax.second,
+                      double(n_global) / double(ncells_));
+    music::ilog.Print("SWIFT : at most %llu hyperslab(s) per task", ranges_max);
+  }
+
+  /**
+   * @brief Log the amount of particle data written and the write rate.
+   *
+   * @param s Species, used to include gas fields in the byte count.
+   * @param n_global Global particle count for the species.
+   * @param t_write Time taken to write the particle data in seconds.
+   */
+  void log_write_rate(const cosmo_species &s, size_t n_global,
+                      double t_write) const {
 
     // Bytes written: positions, velocities, ID and mass, plus internal
     // energy and smoothing length for gas
@@ -1208,15 +1234,8 @@ protected:
     const double gbytes =
         double(n_global) * double(per_particle) / (1024. * 1024. * 1024.);
 
-    // Cell occupancy, then where the time went
-    music::ilog.Print("SWIFT : %zu of %zu cells filled, %lld to %lld particles "
-                      "per cell (mean %.3g)",
-                      n_filled, ncells_, *minmax.first, *minmax.second,
-                      double(n_global) / double(ncells_));
-    music::ilog.Print("SWIFT : sorted in %.3g s, wrote %.3g GB in %.3g s "
-                      "(%.3g GB/s), max %llu hyperslab(s) per task",
-                      tmax[0], gbytes, tmax[1],
-                      tmax[1] > 0. ? gbytes / tmax[1] : 0., ranges_max);
+    music::ilog.Print("SWIFT : wrote %.3g GB at %.3g GB/s", gbytes,
+                      t_write > 0. ? gbytes / t_write : 0.);
   }
 
 public:
@@ -1258,18 +1277,11 @@ public:
             ? 0.0
             : Omega_species * munit_ / double(global_num_particles);
 
-    // Announce the write in the same task style as the LPT steps
-    const std::string task = "Writing " + grp + " to the SWIFT IC file";
-    music::ilog << colors::SYM_CHECK << " " << colors::TASK_NAME << task
-                << colors::RESET << std::setw(77 - (int)task.size())
-                << std::setfill('.') << std::left << "" << std::endl;
-
-    const double t_start = get_wtime();
-
     // Sort the local particles into SWIFT's top-level cells
+    log_task_start("Sorting " + grp + " into top-level cells");
+    double t_start = get_wtime();
     std::vector<size_t> perm;
     std::vector<swift_count_t> local_counts;
-
     if (this->has_64bit_reals()) {
       this->sort_particles_into_cells(pc.positions64_, n_local, perm,
                                       local_counts);
@@ -1277,43 +1289,42 @@ public:
       this->sort_particles_into_cells(pc.positions32_, n_local, perm,
                                       local_counts);
     }
+    log_task_took(t_start);
 
-    // Combine every rank's cells into the global cell lookup table
+    // Combine every rank's cells into the global cell lookup table and get
+    // the file ranges this rank contributes
+    log_task_start("Building the " + grp + " cell lookup table");
+    t_start = get_wtime();
     std::vector<swift_count_t> global_counts, cell_offset, rank_offset;
     this->build_cell_lookup_table(local_counts, global_counts, cell_offset,
                                   rank_offset);
-
-    // Get the file ranges this rank contributes
     const std::vector<swift_write_range> ranges =
         this->build_write_ranges(local_counts, rank_offset);
+    this->log_cell_occupancy(global_num_particles, global_counts,
+                             ranges.size());
+    log_task_took(t_start);
 
-    const double t_sorted = get_wtime();
-
-    // Rank 0 creates the full, empty datasets in the file
+    // Rank 0 creates the full, empty datasets in the file, then every rank
+    // writes its own particles into their cells' slots
+    log_task_start("Writing " + grp + " particle data");
+    t_start = get_wtime();
     if (this_rank_ == 0) {
       this->create_species_datasets(grp, global_num_particles, s);
     }
     this->barrier();
-
-    // Every rank writes its own particles into their cells' slots
     this->write_species_fields(grp, pc, s, perm, ranges, particle_mass);
     this->barrier();
-
-    const double t_written = get_wtime();
+    this->log_write_rate(s, global_num_particles, get_wtime() - t_start);
+    log_task_took(t_start);
 
     // Rank 0 records the cell metadata for this species
+    log_task_start("Writing " + grp + " cell metadata");
+    t_start = get_wtime();
     if (this_rank_ == 0) {
       this->write_species_cell_metadata(grp, global_counts, cell_offset);
     }
     this->barrier();
-
-    // Report the cell occupancy and timings for this species
-    this->log_species_summary(grp, s, global_num_particles, global_counts,
-                              ranges.size(), t_sorted - t_start,
-                              t_written - t_sorted);
-    music::ilog << std::setw(70) << std::setfill(' ') << std::right
-                << "took : " << std::setw(8) << get_wtime() - t_start << "s"
-                << std::endl;
+    log_task_took(t_start);
   }
 };
 
