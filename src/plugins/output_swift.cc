@@ -21,7 +21,6 @@
 #include <array>
 #include <cmath>
 #include <output_plugin.hh>
-#include <unistd.h> // for unlink
 #include <vector>
 
 /**
@@ -32,8 +31,6 @@
  * type on some supported platforms.
  */
 using swift_count_t = long long;
-static_assert(sizeof(swift_count_t) == 8,
-              "SWIFT cell counts need to be 64 bit");
 
 /** @brief Struct to track a contiguous section of a particle dataset written by
  * one MPI rank. */
@@ -167,7 +164,7 @@ public:
    * @param cf Complete monofonIC configuration.
    * @param pcc Cosmology calculator owned by the IC generator.
    *
-   * @throws std::runtime_error If cell geometry or box size is invalid.
+   * @throws std::runtime_error If top_level_cells is out of range.
    */
   explicit swift_output_plugin(config_file &cf,
                                std::unique_ptr<cosmology::calculator> &pcc)
@@ -212,10 +209,6 @@ public:
     if (cdim_ > 1290) {
       throw std::runtime_error("SWIFT output: 'top_level_cells' must not "
                                "exceed 1290 (cell count overflow).");
-    }
-    if (!std::isfinite(dim_) || dim_ <= 0.0) {
-      throw std::runtime_error(
-          "SWIFT output: box size must be finite and positive.");
     }
 
     // Derived cell geometry
@@ -285,8 +278,7 @@ public:
       return;
     }
 
-    // Replace any existing output file
-    unlink(fname_.c_str());
+    // Create the output file, replacing any existing one
     HDFCreateFile(fname_);
 
     // Units group, using the physical constants assumed internally by SWIFT:
@@ -601,7 +593,6 @@ protected:
    * @param n_local Number of local particles.
    * @param[out] perm Source indices ordered by cell, then original local order.
    * @param[out] counts Number of local particles in every cell.
-   * @throws std::runtime_error If any coordinate is non-finite.
    */
   template <typename pos_t>
   void sort_particles_into_cells(const std::vector<pos_t> &pos, size_t n_local,
@@ -614,16 +605,15 @@ protected:
     // Reserve the permutation vector and a temporary cell ID array
     std::vector<uint32_t> cellid(n_local);
 
-    // Wrap positions, assign particles to cells, and update the per-cell
-    // counts
+    // Loop over local particles finding their cell
     for (size_t i = 0; i < n_local; ++i) {
+
+      // Get the wrapped position in output units
       double x[3];
       for (int d = 0; d < 3; ++d) {
+
+        // Wrap to [0, dim_) if needs be
         const double xd = (double)pos[3 * i + d];
-        if (!std::isfinite(xd)) {
-          throw std::runtime_error(
-              "SWIFT output: encountered a non-finite particle coordinate.");
-        }
         x[d] = (double)this->wrap_coord<pos_t>(xd);
       }
 
@@ -637,7 +627,9 @@ protected:
       ++counts[c];
     }
 
-    // counting sort, stable so that the order inside a cell is the input order
+    // Build the stable counting-sort permutation. next[c] is the next free slot
+    // for cell c in the output array, and is incremented as each particle is
+    // placed.
     std::vector<size_t> next(ncells_);
     size_t acc = 0;
     for (size_t c = 0; c < ncells_; ++c) {
@@ -645,6 +637,7 @@ protected:
       acc += (size_t)counts[c];
     }
 
+    // Fill the permutation array in cell order
     perm.resize(n_local);
     for (size_t i = 0; i < n_local; ++i) {
       perm[next[cellid[i]]++] = i;
@@ -655,10 +648,11 @@ protected:
    * @brief Build the global top-level cell lookup table across all ranks.
    *
    * Combines the local cell counts across ranks and derives where
-   * each cell, and this rank's share of it, starts in the species datasets.
-   * rank_offset[c] equals the global start of cell c plus contributions
-   * from lower-numbered ranks. This produces a deterministic cell-major,
-   * rank-major layout without redistributing particles between ranks.
+   * each cell, and this rank's share of it, starts in the particle species
+   * datasets. rank_offset[c] equals the global start of cell c plus
+   * contributions from lower-numbered ranks. This produces a deterministic
+   * cell-major, rank-major layout without redistributing particles between
+   * ranks.
    *
    * @param local_counts This rank's particle count in each cell.
    * @param[out] global_counts Global particle count in each cell.
@@ -669,10 +663,13 @@ protected:
                                std::vector<swift_count_t> &global_counts,
                                std::vector<swift_count_t> &cell_offset,
                                std::vector<swift_count_t> &rank_offset) const {
+
+    // Compute the global counts and the prefix sum of local counts across ranks
     global_counts = local_counts;
     std::vector<swift_count_t> preceding(ncells_, 0);
 
 #ifdef USE_MPI
+    // Collect the counts from all ranks
     MPI_Allreduce(MPI_IN_PLACE, global_counts.data(), (int)ncells_,
                   MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
     MPI_Exscan(local_counts.data(), preceding.data(), (int)ncells_,
@@ -683,6 +680,7 @@ protected:
     }
 #endif
 
+    // Build the cell offsets and this rank's contribution to each cell
     cell_offset.resize(ncells_);
     rank_offset.resize(ncells_);
     swift_count_t off = 0;
@@ -707,19 +705,33 @@ protected:
   std::vector<swift_write_range>
   build_write_ranges(const std::vector<swift_count_t> &local_counts,
                      const std::vector<swift_count_t> &rank_offset) const {
+
+    // Merge adjacent cells into contiguous file ranges. Each range is a
+    // hyperslab in the file, and the union of all hyperslabs is the selection
+    // for this rank's write.
     std::vector<swift_write_range> ranges;
     for (size_t c = 0; c < ncells_; ++c) {
+
+      // Nothing to do for empty cells
       if (local_counts[c] == 0) {
         continue;
       }
+
+      // Get this rank's start in the file for this cell
       const hsize_t fs = (hsize_t)rank_offset[c];
+
+      // If the last range ends where this one starts, merge them
       if (!ranges.empty() &&
           ranges.back().file_start + ranges.back().length == fs) {
         ranges.back().length += (hsize_t)local_counts[c];
-      } else {
+      }
+
+      // Otherwise, start a new range
+      else {
         ranges.push_back({fs, (hsize_t)local_counts[c]});
       }
     }
+
     return ranges;
   }
 
@@ -775,6 +787,7 @@ protected:
 
     HDFCreateGroup(fname_, grp);
 
+    // Call the appropriate template instantiation for the floating-point type
     if (this->has_64bit_reals()) {
       HDFCreateEmptyDatasetVector<double>(fname_, grp + "/Coordinates",
                                           global_num_particles, filter);
@@ -791,6 +804,7 @@ protected:
                                    global_num_particles, filter);
     }
 
+    // Create the ParticleIDs dataset with the appropriate integer type
     if (this->has_64bit_ids()) {
       HDFCreateEmptyDataset<uint64_t>(fname_, grp + "/ParticleIDs",
                                       global_num_particles, filter);
@@ -799,11 +813,14 @@ protected:
                                       global_num_particles, filter);
     }
 
+    // Write the unit exponents for every dataset. SWIFT expects the units to be
     this->write_unit_attributes(grp + "/Coordinates", 0.0, 1.0, 0.0, 1.0);
     this->write_unit_attributes(grp + "/Velocities", 0.0, 1.0, -1.0, 0.0);
     this->write_unit_attributes(grp + "/Masses", 1.0, 0.0, 0.0, 0.0);
     this->write_unit_attributes(grp + "/ParticleIDs", 0.0, 0.0, 0.0, 0.0);
 
+    // Handle baryons if appropriate. SWIFT expects an InternalEnergy and
+    // SmoothingLength dataset for baryons
     if (bdobaryons_ && s == cosmo_species::baryon) {
       HDFCreateEmptyDataset<write_real_t>(fname_, grp + "/InternalEnergy",
                                           global_num_particles, filter);
@@ -828,29 +845,36 @@ protected:
    * @param data Packed field data corresponding to @p ranges in order.
    * @param width Elements per particle, normally one or three.
    * @param dxpl HDF5 transfer property list (H5P_DEFAULT or collective).
-   * @throws std::runtime_error If the dataset cannot be opened or written.
+   * @throws std::runtime_error If the dataset cannot be written.
    */
   template <typename T>
   static void write_ranges(hid_t fid, const std::string &name,
                            const std::vector<swift_write_range> &ranges,
                            const std::vector<T> &data, size_t width,
                            hid_t dxpl) {
-    hid_t dset = H5Dopen(fid, name.c_str());
-    if (dset < 0) {
-      throw std::runtime_error("SWIFT output: cannot open dataset " + name);
-    }
 
+    // Open the dataset created by rank 0
+    hid_t dset = H5Dopen(fid, name.c_str());
+
+    // Get the file space to select this rank's ranges in
     hid_t fspace = H5Dget_space(dset);
     hid_t mspace;
 
+    // Ranks without local particles still take part in the (collective) write,
+    // with empty memory and file selections
     if (ranges.empty()) {
-      // ranks without local particles still take part in the (collective) write
       mspace = H5Screate(H5S_NULL);
       H5Sselect_none(fspace);
-    } else {
+    }
+
+    // Otherwise, select the union of this rank's ranges in the file
+    else {
+
+      // Memory space covering the packed, cell-ordered buffer
       hsize_t mdims[2] = {(hsize_t)(data.size() / width), (hsize_t)width};
       mspace = H5Screate_simple(width > 1 ? 2 : 1, mdims, NULL);
 
+      // OR each range into the file selection, the first one replacing it
       bool first = true;
       for (const auto &r : ranges) {
         hsize_t start[2] = {r.file_start, 0};
@@ -861,11 +885,13 @@ protected:
       }
     }
 
+    // Write the buffer into the selected ranges
     if (H5Dwrite(dset, GetDataType<T>(), mspace, fspace, dxpl,
                  data.empty() ? NULL : &data[0]) < 0) {
       throw std::runtime_error("SWIFT output: failed to write dataset " + name);
     }
 
+    // Clean up
     H5Sclose(mspace);
     H5Sclose(fspace);
     H5Dclose(dset);
@@ -893,9 +919,11 @@ protected:
                         const std::vector<size_t> &perm,
                         const std::vector<swift_write_range> &ranges,
                         double particle_mass) const {
+
+    // Number of local particles, all of which are written
     const size_t n_local = perm.size();
 
-    //... positions, wrapped exactly as when they were sorted into cells
+    // Write the positions, wrapped exactly as when they were sorted into cells
     if (this->has_64bit_reals()) {
       auto buf = apply_cell_order(pc.positions64_, perm, 3);
       for (auto &x : buf) {
@@ -910,7 +938,7 @@ protected:
       write_ranges(fid, grp + "/Coordinates", ranges, buf, 3, dxpl);
     }
 
-    //... velocities
+    // Write the velocities
     if (this->has_64bit_reals()) {
       write_ranges(fid, grp + "/Velocities", ranges,
                    apply_cell_order(pc.velocities64_, perm, 3), 3, dxpl);
@@ -919,7 +947,7 @@ protected:
                    apply_cell_order(pc.velocities32_, perm, 3), 3, dxpl);
     }
 
-    //... ids
+    // Write the particle IDs with the appropriate integer type
     if (this->has_64bit_ids()) {
       write_ranges(fid, grp + "/ParticleIDs", ranges,
                    apply_cell_order(pc.ids64_, perm, 1), 1, dxpl);
@@ -928,7 +956,7 @@ protected:
                    apply_cell_order(pc.ids32_, perm, 1), 1, dxpl);
     }
 
-    //... masses
+    // Write the masses, either per particle from the container...
     if (pc.bhas_individual_masses_) {
       if (this->has_64bit_reals()) {
         write_ranges(fid, grp + "/Masses", ranges,
@@ -937,7 +965,10 @@ protected:
         write_ranges(fid, grp + "/Masses", ranges,
                      apply_cell_order(pc.mass32_, perm, 1), 1, dxpl);
       }
-    } else {
+    }
+
+    // ...or as a constant for every particle
+    else {
       if (this->has_64bit_reals()) {
         write_ranges(fid, grp + "/Masses", ranges,
                      std::vector<double>(n_local, particle_mass), 1, dxpl);
@@ -948,7 +979,8 @@ protected:
       }
     }
 
-    //... gas internal energy and smoothing length if baryons are enabled
+    // Write the gas internal energy and smoothing length, which are constant
+    // for every particle, if baryons are enabled
     if (bdobaryons_ && s == cosmo_species::baryon) {
       write_ranges(
           fid, grp + "/InternalEnergy", ranges,
@@ -982,6 +1014,7 @@ protected:
                             const std::vector<swift_write_range> &ranges,
                             double particle_mass) const {
 #ifdef USE_PARALLEL_HDF5
+    // Open the shared file collectively on every rank
     hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
     H5Pset_fapl_mpio(fapl, MPI_COMM_WORLD, MPI_INFO_NULL);
     hid_t fid = H5Fopen(fname_.c_str(), H5F_ACC_RDWR, fapl);
@@ -990,23 +1023,29 @@ protected:
                                " for collective writing.");
     }
 
+    // Use collective transfers for every dataset write
     hid_t dxpl = H5Pcreate(H5P_DATASET_XFER);
     H5Pset_dxpl_mpio(dxpl, H5FD_MPIO_COLLECTIVE);
 
+    // Write every field
     this->write_all_fields(fid, dxpl, grp, pc, s, perm, ranges, particle_mass);
 
+    // Clean up
     H5Pclose(dxpl);
     H5Fclose(fid);
     H5Pclose(fapl);
 #else
-    // no parallel HDF5: the ranks take turns on the shared file, each one
+    // Without parallel HDF5 the ranks take turns on the shared file, each one
     // opening it once
     for (int rank = 0; rank < num_ranks_; ++rank) {
+
+      // Wait for the previous rank to close the file
       this->barrier();
       if (rank != this_rank_) {
         continue;
       }
 
+      // Open the file, write every field and close it again
       hid_t fid = H5Fopen(fname_.c_str(), H5F_ACC_RDWR, H5P_DEFAULT);
       if (fid < 0) {
         throw std::runtime_error("SWIFT output: cannot open " + fname_ +
@@ -1017,6 +1056,8 @@ protected:
       H5Fclose(fid);
     }
 #endif
+
+    // Report the write
     if (this_rank_ == 0) {
       music::ilog << "Wrote cell-ordered " << grp << " data to the IC file."
                   << std::endl;
@@ -1030,6 +1071,8 @@ protected:
    * flattened order as cell_getid() and all per-species cell datasets.
    */
   void write_common_cell_metadata() const {
+
+    // Write the cell look up table metadata
     HDFCreateGroup(fname_, "Cells");
     HDFCreateGroup(fname_, "Cells/Meta-data");
     HDFWriteGroupAttribute(fname_, "Cells/Meta-data", "nr_cells",
@@ -1041,6 +1084,7 @@ protected:
     HDFWriteGroupAttribute(fname_, "Cells/Meta-data", "Origin",
                            std::vector<double>(3, 0.0));
 
+    // Compute and write the cell centres in cell_getid() order
     std::vector<double> centres(3 * ncells_);
     for (size_t ix = 0; ix < cdim_; ++ix) {
       for (size_t iy = 0; iy < cdim_; ++iy) {
@@ -1054,6 +1098,7 @@ protected:
     }
     HDFWriteDatasetVector(fname_, "Cells/Centres", centres);
 
+    // Create the groups the per-species cell datasets are written into
     HDFCreateGroup(fname_, "Cells/Files");
     HDFCreateGroup(fname_, "Cells/OffsetsInFile");
     HDFCreateGroup(fname_, "Cells/Counts");
@@ -1072,8 +1117,12 @@ protected:
   void write_species_cell_metadata(
       const std::string &grp, const std::vector<swift_count_t> &global_counts,
       const std::vector<swift_count_t> &cell_offset) const {
-    // a single shared file, so every cell lives in file 0
+
+    // A single shared file, so every cell lives in file 0
     HDFWriteDataset(fname_, "Cells/Files/" + grp, std::vector<int>(ncells_, 0));
+
+    // Where each cell starts in the species datasets, and how many particles
+    // it holds
     HDFWriteDataset(fname_, "Cells/OffsetsInFile/" + grp, cell_offset);
     HDFWriteDataset(fname_, "Cells/Counts/" + grp, global_counts);
   }
@@ -1095,6 +1144,8 @@ protected:
   void log_io_timing(const std::string &grp, const cosmo_species &s,
                      size_t n_global, size_t n_ranges, double t_sort,
                      double t_write, double t_meta) const {
+
+    // Take the slowest rank's timings and the largest range count
     double tmax[3] = {t_sort, t_write, t_meta};
     unsigned long long ranges_max = n_ranges;
 #ifdef USE_MPI
@@ -1102,6 +1153,8 @@ protected:
     MPI_Allreduce(MPI_IN_PLACE, &ranges_max, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX,
                   MPI_COMM_WORLD);
 #endif
+
+    // Only rank 0 reports
     if (this_rank_ != 0) {
       return;
     }
@@ -1117,12 +1170,14 @@ protected:
     const double gbytes =
         double(n_global) * double(per_particle) / (1024. * 1024. * 1024.);
 
+    // Name the HDF5 backend in use
 #ifdef USE_PARALLEL_HDF5
     const char *backend = "parallel";
 #else
     const char *backend = "serial";
 #endif
 
+    // Write one machine-readable line for this species
     music::ilog << "SWIFT-IO " << grp << " backend=" << backend
                 << " nranks=" << num_ranks_ << " cdim=" << cdim_
                 << " npart=" << n_global << " max_ranges=" << ranges_max
@@ -1149,17 +1204,23 @@ public:
    */
   void write_particle_data(const particle::container &pc,
                            const cosmo_species &s, double Omega_species) {
+
+    // Get the SWIFT particle type and its group name
     const int sid = get_species_idx(s);
     assert(sid != -1);
     const std::string grp = std::string("PartType") + std::to_string(sid);
 
+    // Get the local and global particle counts
     const size_t n_local = pc.get_local_num_particles();
     const size_t global_num_particles = pc.get_global_num_particles();
 
+    // Record the global count for the header, split into the 32-bit words the
+    // Gadget-style header expects
     npart_[sid] = global_num_particles;
     npartTotal_[sid] = (uint32_t)(global_num_particles);
     npartTotalHighWord_[sid] = (uint32_t)((global_num_particles) >> 32);
 
+    // Constant particle mass, unused when the container has individual masses
     const double particle_mass =
         pc.bhas_individual_masses_
             ? 0.0
@@ -1167,7 +1228,7 @@ public:
 
     const double t_start = get_wtime();
 
-    //... sort the local particles into SWIFT's top-level cells ...........
+    // Sort the local particles into SWIFT's top-level cells
     std::vector<size_t> perm;
     std::vector<swift_count_t> local_counts;
 
@@ -1179,18 +1240,18 @@ public:
                                       local_counts);
     }
 
-    //... combine every rank's cells into the global cell lookup table ...
+    // Combine every rank's cells into the global cell lookup table
     std::vector<swift_count_t> global_counts, cell_offset, rank_offset;
     this->build_cell_lookup_table(local_counts, global_counts, cell_offset,
                                   rank_offset);
 
-    //... the file ranges this rank contributes ...........................
+    // Get the file ranges this rank contributes
     const std::vector<swift_write_range> ranges =
         this->build_write_ranges(local_counts, rank_offset);
 
     const double t_sorted = get_wtime();
 
-    // rank 0 creates the full, empty datasets in the file
+    // Rank 0 creates the full, empty datasets in the file
     if (this_rank_ == 0) {
       this->create_species_datasets(grp, global_num_particles, s);
       music::ilog << "Created empty arrays for " << grp << " into file "
@@ -1198,18 +1259,19 @@ public:
     }
     this->barrier();
 
-    // every rank writes its own particles into their cells' slots
+    // Every rank writes its own particles into their cells' slots
     this->write_species_fields(grp, pc, s, perm, ranges, particle_mass);
     this->barrier();
 
     const double t_written = get_wtime();
 
-    // rank 0 records the cell metadata for this species
+    // Rank 0 records the cell metadata for this species
     if (this_rank_ == 0) {
       this->write_species_cell_metadata(grp, global_counts, cell_offset);
     }
     this->barrier();
 
+    // Report the timings for this species
     this->log_io_timing(grp, s, global_num_particles, ranges.size(),
                         t_sorted - t_start, t_written - t_sorted,
                         get_wtime() - t_written);
