@@ -52,6 +52,17 @@ struct grid_interpolate
   {
   #if defined(USE_MPI)
 
+    // The ghost exchange below sends this rank's first interpolation_order+1
+    // slabs, so a rank holding fewer would read past the end of its grid
+    if (gridref.local_0_size_ < ptrdiff_t(interpolation_order + 1))
+    {
+      music::elog << "grid_interpolate: MPI rank " << MPI::get_rank() << " holds "
+                  << gridref.local_0_size_ << " grid slab(s) but needs at least "
+                  << interpolation_order + 1
+                  << ". Use fewer MPI ranks or a GridRes that splits more evenly." << std::endl;
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     int local_0_start = int(gridref.local_0_start_);
     local0starts_.assign(MPI::get_size(), 0);
 
