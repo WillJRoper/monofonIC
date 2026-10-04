@@ -88,7 +88,11 @@ endif()
 add_library(libclass STATIC ${TOOLS_SRC} ${SOURCE_SRC} ${EXTERNAL_SRC} )
 add_library(class::libclass ALIAS libclass)
 
-target_compile_options(libclass PRIVATE -w -Wno-write-strings -fpermissive -O3 -g )
+# CLASS is built at -O2 with value-safe floating point under the Intel
+# compilers, whose default -fp-model=fast has broken CLASS runs (see
+# class_patch.cmake). These options follow monofonIC's global -O3, so they win
+target_compile_options(libclass PRIVATE -w -Wno-write-strings -fpermissive -O2 -g
+    $<$<CXX_COMPILER_ID:IntelLLVM,Intel>:-fp-model=precise> )
 set_property(TARGET libclass PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_compile_definitions(libclass PUBLIC "__CLASSDIR__=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
