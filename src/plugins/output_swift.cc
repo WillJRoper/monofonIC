@@ -1059,6 +1059,32 @@ protected:
   }
 
   /**
+   * @brief Position of the same point within every top-level cell.
+   *
+   * The point sits at fraction @p frac of the cell width along each axis, so
+   * 0 gives the lower corner, 0.5 the centre and 1 the upper corner. Cells are
+   * flattened in cell_getid() order, as in every /Cells dataset.
+   *
+   * @param frac Fractional position within each cell.
+   *
+   * @return Positions in Mpc, flattened as (cell, dimension).
+   */
+  std::vector<double> cell_positions(double frac) const {
+    std::vector<double> pos(3 * ncells_);
+    for (size_t ix = 0; ix < cdim_; ++ix) {
+      for (size_t iy = 0; iy < cdim_; ++iy) {
+        for (size_t iz = 0; iz < cdim_; ++iz) {
+          const size_t c = (ix * cdim_ + iy) * cdim_ + iz;
+          pos[3 * c + 0] = (double(ix) + frac) * cell_width_;
+          pos[3 * c + 1] = (double(iy) + frac) * cell_width_;
+          pos[3 * c + 2] = (double(iz) + frac) * cell_width_;
+        }
+      }
+    }
+    return pos;
+  }
+
+  /**
    * @brief Write species-independent /Cells groups, attributes, and centres.
    *
    * Called only by rank zero during construction. Cell centres use the same
@@ -1078,31 +1104,25 @@ protected:
     HDFWriteGroupAttribute(fname_, "Cells/Meta-data", "Origin",
                            std::vector<double>(3, 0.0));
 
-    // Compute and write the cell centres in cell_getid() order
-    std::vector<double> centres(3 * ncells_);
-    for (size_t ix = 0; ix < cdim_; ++ix) {
-      for (size_t iy = 0; iy < cdim_; ++iy) {
-        for (size_t iz = 0; iz < cdim_; ++iz) {
-          const size_t c = (ix * cdim_ + iy) * cdim_ + iz;
-          centres[3 * c + 0] = (double(ix) + 0.5) * cell_width_;
-          centres[3 * c + 1] = (double(iy) + 0.5) * cell_width_;
-          centres[3 * c + 2] = (double(iz) + 0.5) * cell_width_;
-        }
-      }
-    }
-    HDFWriteDatasetVector(fname_, "Cells/Centres", centres);
+    // Write the cell centres in cell_getid() order
+    HDFWriteDatasetVector(fname_, "Cells/Centres", this->cell_positions(0.5));
 
     // Create the groups the per-species cell datasets are written into
     HDFCreateGroup(fname_, "Cells/Files");
     HDFCreateGroup(fname_, "Cells/OffsetsInFile");
     HDFCreateGroup(fname_, "Cells/Counts");
+    HDFCreateGroup(fname_, "Cells/MinPositions");
+    HDFCreateGroup(fname_, "Cells/MaxPositions");
   }
 
   /**
-   * @brief Write counts, offsets and file indices for one species.
+   * @brief Write counts, offsets, file indices and bounds for one species.
    *
    * Called only by rank zero. Files is zero for every cell because this
-   * plugin always writes one shared output file.
+   * plugin always writes one shared output file. The bounds are the geometric
+   * cell edges, which contain every particle since positions are wrapped
+   * into the cell they are sorted into; swiftsimio uses them to mask without
+   * padding the requested region.
    *
    * @param grp Particle group name used as each metadata dataset name.
    * @param global_counts Global particle count in each cell.
@@ -1119,6 +1139,12 @@ protected:
     // it holds
     HDFWriteDataset(fname_, "Cells/OffsetsInFile/" + grp, cell_offset);
     HDFWriteDataset(fname_, "Cells/Counts/" + grp, global_counts);
+
+    // The geometric bounds of each cell
+    HDFWriteDatasetVector(fname_, "Cells/MinPositions/" + grp,
+                          this->cell_positions(0.0));
+    HDFWriteDatasetVector(fname_, "Cells/MaxPositions/" + grp,
+                          this->cell_positions(1.0));
   }
 
   /**
