@@ -428,13 +428,21 @@ private:
     call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_theta_ncdm1, tau, &t_ncdm[0]);
 
     switch( total_type_ ){
+      // CLASS only defines index_tp_theta_m and index_tp_theta_cb for number
+      // count C_l with RSD, so they are uninitialised for our outputs. Reading
+      // them crashed on random MPI ranks at scale; theta_matter is not used for
+      // the ICs, so it is left at zero unless CLASS actually computed it
       case cosmology::MATTER_ :
         call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_delta_m, tau, &d_tot[0]);
-        call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_theta_m, tau, &t_tot[0]);
+        if (pt_.has_source_theta_m == _TRUE_) {
+          call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_theta_m, tau, &t_tot[0]);
+        }
         break;
       case cosmology::BPLUSC_ :
         call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_delta_cb, tau, &d_tot[0]);
-        call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_theta_cb, tau, &t_tot[0]);
+        if (pt_.has_source_theta_cb == _TRUE_) {
+          call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_theta_cb, tau, &t_tot[0]);
+        }
         break;
       case cosmology::TOTAL_ :
         call_perturb_sources_at_tau(index_md, 0, pt_.index_tp_delta_tot, tau, &d_tot[0]);
