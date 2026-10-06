@@ -21,9 +21,21 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <output_plugin.hh>
+#include <set>
+#include <sstream>
+#include <utility>
 #include <vector>
+
+#if defined(USE_CLASS)
+// CLASS version information, recorded in the ICs metadata
+extern "C" {
+extern const char *CLASS_GIT_REV;
+extern const char *CLASS_GIT_TAG;
+}
+#endif
 
 /**
  * @brief Signed 64-bit type used for cell counts and particle offsets.
@@ -151,8 +163,11 @@ protected:
   //! Initial gas smoothing length in Mpc (comoving).
   double smoothing_length_;
 
-  //! Initial gas temperature over the mean molecular weight, in K, for the log.
+  //! Initial gas temperature over the mean molecular weight, in K.
   double gas_temperature_over_mu_;
+
+  //! Mean particle mass of each particle type, for the ICs metadata.
+  std::array<double, 7> mean_particle_mass_;
 
 public:
   /**
@@ -221,11 +236,13 @@ public:
     cell_width_ = dim_ / double(cdim_);
     iwidth_ = double(cdim_) / dim_;
 
-    // Particle counts are filled in per species as they are written
+    // Particle counts and masses are filled in per species as they are
+    // written
     for (int i = 0; i < 7; ++i) {
       npart_[i] = 0;
       npartTotal_[i] = 0;
       npartTotalHighWord_[i] = 0;
+      mean_particle_mass_[i] = 0.0;
     }
 
 #ifdef USE_MPI
@@ -300,59 +317,6 @@ public:
     HDFCreateGroup(fname_, "Code");
     HDFWriteGroupAttribute(fname_, "Code", "Code", std::string("SWIFT"));
 
-    // Write MUSIC configuration header
-    int order = cf_.get_value<int>("setup", "LPTorder");
-    std::string load = cf_.get_value<std::string>("setup", "ParticleLoad");
-    std::string tf = cf_.get_value<std::string>("cosmology", "transfer");
-    std::string cosmo_set =
-        cf_.get_value<std::string>("cosmology", "ParameterSet");
-    std::string rng = cf_.get_value<std::string>("random", "generator");
-    int do_fixing = cf_.get_value<bool>("setup", "DoFixing");
-    int do_invert = cf_.get_value<bool>("setup", "DoInversion");
-    int do_baryons = cf_.get_value<bool>("setup", "DoBaryons");
-    int do_baryonsVrel = cf_.get_value<bool>("setup", "DoBaryonVrel");
-    int L = cf_.get_value<int>("setup", "GridRes");
-
-    // Write the ICs parameters group including all relevant information about
-    // the ICs generation
-    HDFCreateGroup(fname_, "ICs_parameters");
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Code",
-                           std::string("MUSIC2 - monofonIC"));
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Git Revision",
-                           std::string(GIT_REV));
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Git Tag",
-                           std::string(GIT_TAG));
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Git Branch",
-                           std::string(GIT_BRANCH));
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Precision",
-                           std::string(CMAKE_PRECISION_STR));
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Convolutions",
-                           std::string(CMAKE_CONVOLVER_STR));
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "PLT",
-                           std::string(CMAKE_PLT_STR));
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "LPT Order", order);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Particle Load", load);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Transfer Function", tf);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Cosmology Parameter Set",
-                           cosmo_set);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Random Generator", rng);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Mode Fixing", do_fixing);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Mode inversion",
-                           do_invert);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Baryons", do_baryons);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters",
-                           "Baryons Relative Velocity", do_baryonsVrel);
-    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Grid Resolution", L);
-    if (tf == "CLASS") {
-      double ztarget = cf_.get_value<double>("cosmology", "ztarget");
-      HDFWriteGroupAttribute(fname_, "ICs_parameters", "Target Redshift",
-                             ztarget);
-    }
-    if (rng == "PANPHASIA") {
-      std::string desc = cf_.get_value<std::string>("random", "descriptor");
-      HDFWriteGroupAttribute(fname_, "ICs_parameters", "Descriptor", desc);
-    }
-
     this->write_common_cell_metadata();
   }
 
@@ -369,6 +333,10 @@ public:
   ~swift_output_plugin() {
     if (!std::uncaught_exceptions()) {
       if (this_rank_ == 0) {
+
+        // Record everything needed to reproduce these ICs; SWIFT copies this
+        // group into every snapshot
+        this->write_ics_metadata();
 
         // Write Standard Gadget / SWIFT hdf5 header
         HDFCreateGroup(fname_, "Header");
@@ -1148,6 +1116,296 @@ protected:
   }
 
   /**
+   * @brief Split "key = value" lines into trimmed key-value pairs.
+   *
+   * Lines are split at their first '='. Blank lines, comments starting with
+   * '#' and lines without '=' are skipped.
+   *
+   * @param in Stream to read the lines from.
+   *
+   * @return Key-value pairs in the order they appear.
+   */
+  static std::vector<std::pair<std::string, std::string>>
+  parse_key_values(std::istream &in) {
+
+    // Strip surrounding whitespace
+    auto trim = [](const std::string &str) {
+      const size_t first = str.find_first_not_of(" \t\r");
+      const size_t last = str.find_last_not_of(" \t\r");
+      return (first == std::string::npos) ? std::string()
+                                          : str.substr(first, last - first + 1);
+    };
+
+    // Keep each "key = value" line, split at its first '='
+    std::vector<std::pair<std::string, std::string>> pairs;
+    std::string line;
+    while (std::getline(in, line)) {
+
+      // Skip blank lines, comments and lines that are not key-value pairs
+      const size_t eq = line.find('=');
+      if (line.empty() || line[0] == '#' || eq == std::string::npos) {
+        continue;
+      }
+
+      pairs.emplace_back(trim(line.substr(0, eq)), trim(line.substr(eq + 1)));
+    }
+
+    return pairs;
+  }
+
+  /**
+   * @brief Copy one of monofonIC's input tables into the ICs metadata.
+   *
+   * The table is read from the text file monofonIC writes next to the
+   * configuration, and each column becomes a dataset named after its header
+   * (the k column is named "k", with its units as a group attribute).
+   *
+   * @param grp Group to write the columns into.
+   * @param filename Table file name, relative to the configuration.
+   */
+  void write_input_table(const std::string &grp,
+                         const std::string &filename) const {
+
+    // The table is written by the IC generator, so it should always exist
+    std::ifstream in(cf_.get_path_relative_to_config(filename));
+    if (!in) {
+      music::wlog << "SWIFT : could not read " << filename
+                  << " to store in the ICs metadata" << std::endl;
+      return;
+    }
+
+    // The column header is written with a field width of 20 characters per
+    // column, the first starting after "# "; data lines are whitespace
+    // separated numbers
+    std::vector<std::string> names;
+    std::vector<std::vector<double>> columns;
+    std::string line;
+    while (std::getline(in, line)) {
+
+      // The header line naming the columns starts with the k column
+      if (line.rfind("#", 0) == 0) {
+        if (line.find("k [h/Mpc]") != std::string::npos) {
+          names = {"k"};
+          for (size_t pos = 20; pos < line.size(); pos += 20) {
+            std::istringstream field(line.substr(pos, 20));
+            std::string name;
+            field >> name;
+            names.push_back(name);
+          }
+        }
+        continue;
+      }
+
+      // Append each number to its column
+      std::istringstream values(line);
+      double value;
+      size_t column = 0;
+      while (values >> value) {
+        if (columns.size() <= column) {
+          columns.emplace_back();
+        }
+        columns[column++].push_back(value);
+      }
+    }
+
+    // Write one dataset per column. The header can name more columns than
+    // are written, so the first names are used; generic names are the
+    // fallback if it names too few
+    HDFCreateGroup(fname_, grp);
+    HDFWriteGroupAttribute(fname_, grp, "k units", std::string("h/Mpc"));
+    HDFWriteGroupAttribute(fname_, grp, "Scale-factor", (double)astart_);
+    for (size_t c = 0; c < columns.size(); ++c) {
+      const std::string name = (names.size() >= columns.size())
+                                   ? names[c]
+                                   : "column_" + std::to_string(c);
+      HDFWriteDataset(fname_, grp + "/" + name, columns[c]);
+    }
+  }
+
+  /**
+   * @brief Write everything needed to reproduce these ICs to /ICs_parameters.
+   *
+   * SWIFT copies this group unchanged into every snapshot, so the run can be
+   * reproduced from any SWIFT output. Called by rank zero from the
+   * destructor, once the input tables have been written and every species'
+   * particle mass is known. Alongside the summary attributes of the group
+   * itself, it holds:
+   *  - Config: every configuration option, one sub-group per section;
+   *  - Cosmology: the cosmological parameters actually used, after defaults;
+   *  - Build: compiler, libraries, CLASS version and parallel layout;
+   *  - Derived: growth factors, sigma_8, particle masses and gas state;
+   *  - CLASS: the CLASS input parameters, when CLASS is the transfer function;
+   *  - InputPowerSpectrum and InputTransferFunctions: the input tables.
+   */
+  void write_ics_metadata() const {
+
+    // Read the main choices from the configuration
+    int order = cf_.get_value<int>("setup", "LPTorder");
+    std::string load = cf_.get_value<std::string>("setup", "ParticleLoad");
+    std::string tf = cf_.get_value<std::string>("cosmology", "transfer");
+    std::string cosmo_set =
+        cf_.get_value<std::string>("cosmology", "ParameterSet");
+    std::string rng = cf_.get_value<std::string>("random", "generator");
+    int do_fixing = cf_.get_value<bool>("setup", "DoFixing");
+    int do_invert = cf_.get_value<bool>("setup", "DoInversion");
+    int do_baryons = cf_.get_value<bool>("setup", "DoBaryons");
+    int do_baryonsVrel = cf_.get_value<bool>("setup", "DoBaryonVrel");
+    int L = cf_.get_value<int>("setup", "GridRes");
+
+    // Write them as a summary, as attributes of the group itself
+    HDFCreateGroup(fname_, "ICs_parameters");
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Code",
+                           std::string("MUSIC2 - monofonIC"));
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Git Revision",
+                           std::string(GIT_REV));
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Git Tag",
+                           std::string(GIT_TAG));
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Git Branch",
+                           std::string(GIT_BRANCH));
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Precision",
+                           std::string(CMAKE_PRECISION_STR));
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Convolutions",
+                           std::string(CMAKE_CONVOLVER_STR));
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "PLT",
+                           std::string(CMAKE_PLT_STR));
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "LPT Order", order);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Particle Load", load);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Transfer Function", tf);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Cosmology Parameter Set",
+                           cosmo_set);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Random Generator", rng);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Mode Fixing", do_fixing);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Mode inversion",
+                           do_invert);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Baryons", do_baryons);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters",
+                           "Baryons Relative Velocity", do_baryonsVrel);
+    HDFWriteGroupAttribute(fname_, "ICs_parameters", "Grid Resolution", L);
+
+    // Only CLASS back-scales from a target redshift
+    if (tf == "CLASS") {
+      double ztarget = cf_.get_value<double>("cosmology", "ztarget");
+      HDFWriteGroupAttribute(fname_, "ICs_parameters", "Target Redshift",
+                             ztarget);
+    }
+
+    // PANPHASIA's phases are set by its descriptor
+    if (rng == "PANPHASIA") {
+      std::string desc = cf_.get_value<std::string>("random", "descriptor");
+      HDFWriteGroupAttribute(fname_, "ICs_parameters", "Descriptor", desc);
+    }
+
+    // Dump every configuration option exactly as read, as
+    // "section/key = value" lines
+    std::ostringstream dump;
+    cf_.dump(dump);
+    std::istringstream config_lines(dump.str());
+
+    // Write each option into its section's sub-group, creating the sub-group
+    // the first time the section appears
+    HDFCreateGroup(fname_, "ICs_parameters/Config");
+    std::set<std::string> sections;
+    for (const auto &kv : parse_key_values(config_lines)) {
+
+      // Split "section/key"; options without a section go into "general"
+      const size_t slash = kv.first.find('/');
+      const std::string section =
+          (slash == std::string::npos) ? "general" : kv.first.substr(0, slash);
+      const std::string key =
+          (slash == std::string::npos) ? kv.first : kv.first.substr(slash + 1);
+      const std::string section_grp = "ICs_parameters/Config/" + section;
+
+      // Create the section's sub-group on first use
+      if (sections.insert(section).second) {
+        HDFCreateGroup(fname_, section_grp);
+      }
+
+      HDFWriteGroupAttribute(fname_, section_grp, key, kv.second);
+    }
+
+    // The cosmological parameters actually used, including defaults and
+    // derived values
+    HDFCreateGroup(fname_, "ICs_parameters/Cosmology");
+    for (const auto &param : pcc_->cosmo_param_.get_all()) {
+      HDFWriteGroupAttribute(fname_, "ICs_parameters/Cosmology", param.first,
+                             param.second);
+    }
+
+    // How the code was built and run
+    const std::string build = "ICs_parameters/Build";
+    HDFCreateGroup(fname_, build);
+    HDFWriteGroupAttribute(fname_, build, "Build Type",
+                           std::string(CMAKE_BUILDTYPE_STR));
+    HDFWriteGroupAttribute(fname_, build, "Compiler", std::string(__VERSION__));
+    HDFWriteGroupAttribute(fname_, build, "FFTW Version",
+                           std::string(FFTW_API(version)));
+
+    // HDF5 reports its version as three numbers
+    unsigned hdf5_major, hdf5_minor, hdf5_release;
+    H5get_libversion(&hdf5_major, &hdf5_minor, &hdf5_release);
+    HDFWriteGroupAttribute(fname_, build, "HDF5 Version",
+                           std::to_string(hdf5_major) + "." +
+                               std::to_string(hdf5_minor) + "." +
+                               std::to_string(hdf5_release));
+#if defined(USE_CLASS)
+    // Only builds with CLASS know its version
+    HDFWriteGroupAttribute(fname_, build, "CLASS Revision",
+                           std::string(CLASS_GIT_REV));
+    HDFWriteGroupAttribute(fname_, build, "CLASS Tag",
+                           std::string(CLASS_GIT_TAG));
+#endif
+
+    // The parallel layout the ICs were generated with
+    HDFWriteGroupAttribute(fname_, build, "MPI Ranks", num_ranks_);
+    HDFWriteGroupAttribute(fname_, build, "Threads", CONFIG::num_threads);
+
+    // Derived quantities, to check a reproduction against
+    const std::string derived = "ICs_parameters/Derived";
+    HDFCreateGroup(fname_, derived);
+    HDFWriteGroupAttribute(fname_, derived, "D+ start", pcc_->Dplus_start_);
+    HDFWriteGroupAttribute(fname_, derived, "D+ target", pcc_->Dplus_target_);
+    HDFWriteGroupAttribute(fname_, derived, "sigma_8",
+                           (double)pcc_->compute_sigma8());
+
+    // Only species that were written have a particle mass
+    for (int i = 0; i < 7; ++i) {
+      if (npart_[i] > 0) {
+        HDFWriteGroupAttribute(fname_, derived,
+                               "Mean particle mass PartType" +
+                                   std::to_string(i) + " [1e10 Msun]",
+                               mean_particle_mass_[i]);
+      }
+    }
+
+    // The initial gas state, when baryons are enabled
+    if (bdobaryons_) {
+      HDFWriteGroupAttribute(fname_, derived, "Gas temperature over mu [K]",
+                             gas_temperature_over_mu_);
+      HDFWriteGroupAttribute(fname_, derived, "Gas internal energy [(km/s)^2]",
+                             internal_energy_);
+      HDFWriteGroupAttribute(fname_, derived, "Gas smoothing length [Mpc]",
+                             smoothing_length_);
+    }
+
+    // The CLASS input parameters, as written by the CLASS plugin
+    if (tf == "CLASS") {
+      std::ifstream ini(
+          cf_.get_path_relative_to_config("input_class_parameters.ini"));
+      HDFCreateGroup(fname_, "ICs_parameters/CLASS");
+      for (const auto &kv : parse_key_values(ini)) {
+        HDFWriteGroupAttribute(fname_, "ICs_parameters/CLASS", kv.first,
+                               kv.second);
+      }
+    }
+
+    // The input power spectra and transfer functions at the starting time
+    this->write_input_table("ICs_parameters/InputPowerSpectrum",
+                            "input_powerspec.txt");
+    this->write_input_table("ICs_parameters/InputTransferFunctions",
+                            "input_transfer.txt");
+  }
+
+  /**
    * @brief Log the cell grid, HDF5 backend and initial gas state.
    *
    * Called from the constructor on every rank; only rank 0 logs at info
@@ -1302,6 +1560,8 @@ public:
         pc.bhas_individual_masses_
             ? 0.0
             : Omega_species * munit_ / double(global_num_particles);
+    mean_particle_mass_[sid] =
+        Omega_species * munit_ / double(global_num_particles);
 
     // Sort the local particles into SWIFT's top-level cells
     log_task_start("Sorting " + grp + " into top-level cells");
