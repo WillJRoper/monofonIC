@@ -1355,13 +1355,9 @@ public:
 };
 
 namespace {
-// Particle data are written at the precision monofonIC was built with
-// (CODE_PRECISION); long double builds write doubles
-#if defined(USE_PRECISION_FLOAT)
-output_plugin_creator_concrete<swift_output_plugin<float>> creator301("SWIFT");
-#else
+// SWIFT expects double-precision IC data, so particle data are always written
+// as doubles, whatever precision monofonIC was built with (CODE_PRECISION)
 output_plugin_creator_concrete<swift_output_plugin<double>> creator301("SWIFT");
-#endif
 } // namespace
 
 #endif
